@@ -4,28 +4,34 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"redis"
 	"encoding/json"
+	"log"
+	"math/rand"
 )
 
+import "io/ioutil"
+import "github.com/mediocregopher/radix.v2/pool"
 import "database/sql"
 import _ "github.com/go-sql-driver/mysql"
 
 // -------------------- Redis --------------------
-var redis *Pool
+var redis *pool.Pool
 func init_redis() {
-	redis err := pool.New("tcp", "localhost:6379", 10)
+	redis, err := pool.New("tcp", "localhost:6379", 10)
 	if err != nil {
 		log.Fatal(err)
 	}
-	conn, err := p.Get()
+}
+
+func redis_add_token(token string, uid int) {
+	conn, err := redis.Get()
 	if err != nil {
 		log.Fatal(err)
 	}
-	if conn.Cmd("SOME", "CMD").Err != nil {
+	if conn.Cmd("PUT", token, uid).Err != nil {
 		log.Fatal(err)
 	}
-	p.Put(conn)
+	redis.Put(conn)
 }
 
 
@@ -42,7 +48,7 @@ const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 func RandStringBytes(n int) string {
 	b := make([]byte, n)
 	for i := range b {
-		b[i] = letterBytes[rand.Intn(len(letterBytes))]
+		b[i] = letters[rand.Intn(len(letters))]
 	}
 	return string(b)
 }
@@ -87,12 +93,12 @@ func login(w http.ResponseWriter, r *http.Request) {
 	}
 	token := "token" + RandStringBytes(10)
 	// TODO: multi redis instance, each for one table?
-	redis_add_token(token, user.uid)
-	w.Write([]byte(`{
-		"user_id": ` + user.uid + `,
-		"username": "` + username + `",
-		"access_token": "` + token + `"
-	}`))
+	redis_add_token(token, user.user_id)
+	w.Write([]byte(fmt.Sprintf(`{
+		"user_id": %d,
+		"username": %s,
+		"access_token": %s
+	}`, user.user_id, body.username, token)))
 }
 
 // -------------------- Cart --------------------
@@ -106,7 +112,7 @@ func carts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == "POST" {
-		post_orders(w, token)
+		post_carts(w, token)
 	} else if r.Method == "PATCH" {
 		js, err := ioutil.ReadAll(r.Body)
 		if err != nil {
@@ -127,7 +133,7 @@ func carts(w http.ResponseWriter, r *http.Request) {
 			}`))
 			return
 		}
-		patch_orders(w, token, cart_id, body)
+		patch_carts(w, token, cart_id, body)
 	} else {
 		// TODO: comment out all redundant checks
 		w.Write([]byte("Wrong Method"))
@@ -137,9 +143,9 @@ func carts(w http.ResponseWriter, r *http.Request) {
 func post_carts(w http.ResponseWriter, token string) {
 	cart_id = "cart1d" + RandStringBytes(11)
 	redis_add_cart(card_id, token)
-	w.Write([]byte(`{
-		"cart_id": ` + cart_id + `
-	}`))
+	w.Write([]byte(fmt.Sprintf(`{
+		"cart_id": %d
+	}`, cart_id)))
 }
 
 func patch_carts(
@@ -280,7 +286,7 @@ func orders(w http.ResponseWriter, r *http.Request) {
 }
 
 // -------------------- Food --------------------
-type Food {
+type Food struct {
 	food_id int
 	price int
 	stock int
@@ -312,7 +318,7 @@ type User struct {
 	// access_token string // hidden to map key
 	done bool
 	total int
-	order Cart // get async
+	//order Cart // get async
 }
 
 type UserP struct {
@@ -324,7 +330,7 @@ var tokens [11001]string
 var userps map[string]UserP
 
 func gen_token() {
-	for i := range(0, 11000) {
+	for i := 0; i<11001; i++ {
 		tokens[i] = RandStringBytes(10);
 	}
 }
@@ -345,7 +351,7 @@ func cache_foods() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		foods_cache[id] = {stock, price}
+		foods_cache[id] = Food{stock, price}
 	}
 	err = rows.Err()
 	if err != nil {
@@ -367,7 +373,7 @@ func cache_users() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		userps[name] = {id, pass}
+		userps[name] = UserP{id, pass}
 	}
 	err = rows.Err()
 	if err != nil {
@@ -440,7 +446,7 @@ func get_token(w http.ResponseWrite, r *http.Request) (string, error) {
 		"code": "INVALID_ACCESS_TOKEN",
 		"message": "无效的令牌"
 	}`))
-	return nil, new Error()
+	return nil, errors.New()
 }
 
 /*
