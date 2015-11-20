@@ -1,5 +1,3 @@
-// Go hello-world implementation for eleme/hackathon.
-
 package main
 
 import (
@@ -7,8 +5,28 @@ import (
 	"net/http"
 	"os"
 	"redis"
+	"encoding/json"
 )
 
+import "database/sql"
+import _ "github.com/go-sql-driver/mysql"
+
+// -------------------- Redis --------------------
+var redis *Pool
+func init_redis() {
+	redis err := pool.New("tcp", "localhost:6379", 10)
+	if err != nil {
+		log.Fatal(err)
+	}
+	conn, err := p.Get()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if conn.Cmd("SOME", "CMD").Err != nil {
+		log.Fatal(err)
+	}
+	p.Put(conn)
+}
 
 
 func redis_set(key string, value string) {
@@ -19,25 +37,6 @@ func redis_get(key string) {
 
 }
 
-// TODO: weaken the consistency
-func foods(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
-		w.Write([]byte("Wrong Method"))
-		return
-	}
-
-
-	ret := `[
-	`
-
-	for i in foods {
-		ret += `{"id": ` + id + `, "price": ` + price + `, "stock": ` + stock + `99},
-		`
-	}
-	ret += `]`
-
-	w.Write(ret.to_bytes())
-}
 
 const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 func RandStringBytes(n int) string {
@@ -48,41 +47,87 @@ func RandStringBytes(n int) string {
 	return string(b)
 }
 
+
+// -------------------- Login --------------------
+type BodyLogin struct {
+	username string
+	password string
+}
 func login(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		w.Write([]byte("Wrong Method"))
+	// check POST
+	//body, err := ioutil.ReadAll(io.LimitReader(r.Body, 1048576))
+	js, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(400)
+		w.Write([]byte(`{
+			"code": "EMPTY_REQUEST",
+			"message": "请求体为空"
+		}`))
 		return
 	}
-	r.ParseForm()
-	username := u.Form["username"]
-	password := u.Form["password"]
-	uid, err := login_db(username, password)
-	if err != nil {
+	var body BodyLogin;
+	//if err := r.Body.Close(); err != nil { }
+	if err := json.Unmarshal(js, &body); err != nil {
+		w.WriteHeader(400)
+		w.Write([]byte(`{
+			"code": "MALFORMED_JSON",
+			"message": "格式错误"
+		}`))
+		return
+	}
+
+	user, ok := userps[body.username]
+	if !ok || user.password != body.password {
+		w.WriteHeader(403)
 		w.Write([]byte(`{
 			"code": "USER_AUTH_FAIL",
 			"message": "用户名或密码错误"
 		}`))
 		return
 	}
-	access_token := "acctoken" + RandStringBytes(10)
+	token := "token" + RandStringBytes(10)
 	// TODO: multi redis instance, each for one table?
-	redis_set(access_token, uid)
+	redis_add_token(token, user.uid)
 	w.Write([]byte(`{
-		"user_id": ` + uid + `,
+		"user_id": ` + user.uid + `,
 		"username": "` + username + `",
-		"access_token": "` + access_token + `"
+		"access_token": "` + token + `"
 	}`))
 }
 
+// -------------------- Cart --------------------
+type BodyCart struct {
+	food_id int
+	count int
+}
 func carts(w http.ResponseWriter, r *http.Request) {
-	token, err := getToken(w, r)
+	token, err := get_token(w, r)
 	if err != nil {
 		return
 	}
 	if r.Method == "POST" {
 		post_orders(w, token)
 	} else if r.Method == "PATCH" {
-		patch_orders(w, token)
+		js, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(400)
+			w.Write([]byte(`{
+				"code": "EMPTY_REQUEST",
+				"message": "请求体为空"
+			}`))
+			return
+		}
+		var body BodyCart;
+		//if err := r.Body.Close(); err != nil { }
+		if err := json.Unmarshal(js, &body); err != nil {
+			w.WriteHeader(400)
+			w.Write([]byte(`{
+				"code": "MALFORMED_JSON",
+				"message": "格式错误"
+			}`))
+			return
+		}
+		patch_orders(w, token, cart_id, body)
 	} else {
 		// TODO: comment out all redundant checks
 		w.Write([]byte("Wrong Method"))
@@ -91,16 +136,98 @@ func carts(w http.ResponseWriter, r *http.Request) {
 
 func post_carts(w http.ResponseWriter, token string) {
 	cart_id = "cart1d" + RandStringBytes(11)
+	redis_add_cart(card_id, token)
 	w.Write([]byte(`{
 		"cart_id": ` + cart_id + `
 	}`))
 }
 
-func patch_carts(w http.ResponseWriter, token string) {
+func patch_carts(
+	w http.ResponseWriter,
+	token string,
+	cart_id int,
+	body BodyCart) {
+
+	cart = redis_get_cart(cart_id)
+	if cart == nil {
+		w.Write([]byte(`{
+			"code": "CART_NOT_FOUND",
+			"message": "篮子不存在"
+		}`))
+		return
+	}
+	if token != cart.token {
+		w.WriteHeader(401)
+		w.Write([]byte(`{
+			"code": "NOT_AUTHORIZED_TO_ACCESS_CART",
+			"message": "无权限访问指定的篮子"
+		}`))
+		return
+	}
+	if cart.count >= 3 {
+		w.WriteHeader(403)
+		w.Write([]byte(`{
+			"code": "FOOD_OUT_OF_LIMIT",
+			"message": "篮子中食物数量超过了三个"
+		}`))
+		return
+	}
+
+	_, ok := foods_cache[food_id]
+	if !ok {
+		w.WriteHeader(404)
+		w.Write([]byte(`{
+			"code": "FOOD_NOT_FOUND",
+			"message": "食物不存在"
+		}`))
+		return
+	}
+	redis_add_to_cart(cart_id, food_id, count)
+	w.WriteHeader(204)
 }
 
-func post_orders(w http.ResponseWriter, token string) {
+// -------------------- Order --------------------
+type BodyOrder struct {
+	cart_id string
+}
+func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
+	cart = redis_get_cart(body.cart_id)
+	if cart == nil {
+		w.WriteHeader(404)
+		w.Write([]byte(`{
+			"code": "CART_NOT_FOUND",
+			"message": "篮子不存在"
+		}`))
+		return
+	}
+	if token != cart.token {
+		w.WriteHeader(403)
+		w.Write([]byte(`{
+			"code": "NOT_AUTHORIZED_TO_ACCESS_CART",
+			"message": "无权限访问指定的篮子"
+		}`))
+		return
+	}
+	if token.done {
+		w.WriteHeader(403)
+		w.Write([]byte(`{
+			"code": "ORDER_OUT_OF_LIMIT",
+			"message": "每个用户只能下一单"
+		}`))
+	}
+	err := redis_commmit_order(cart)
+	if  err != nil {
+		w.WriteHeader(403)
+		w.Write([]byte(`{
+			"code": "FOOD_OUT_OF_STOCK",
+			"message": "食物库存不足"
+		}`))
+		return
+	}
 
+	w.Write([]byte(`{
+		"id ": "0"
+	}`))
 }
 
 func get_orders(w http.ResponseWriter, token string) {
@@ -119,29 +246,62 @@ func get_orders(w http.ResponseWriter, token string) {
 }
 
 func orders(w http.ResponseWriter, r *http.Request) {
-	token, err := getToken(w, r)
+	token, err := get_token(w, r)
 	if err != nil {
 		return
 	}
 	if r.Method == "GET" {
 		get_orders(w, token)
 	} else if r.Method == "POST" {
-		post_orders(w, token)
+		js, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(400)
+			w.Write([]byte(`{
+				"code": "EMPTY_REQUEST",
+				"message": "请求体为空"
+			}`))
+			return
+		}
+		var body BodyOrder;
+		//if err := r.Body.Close(); err != nil { }
+		if err := json.Unmarshal(js, &body); err != nil {
+			w.WriteHeader(400)
+			w.Write([]byte(`{
+				"code": "MALFORMED_JSON",
+				"message": "格式错误"
+			}`))
+			return
+		}
+		post_orders(w, token, body)
 	} else {
 		// TODO: comment out all redundant checks
 		w.Write([]byte("Wrong Method"))
 	}
 }
 
-type Item {
+// -------------------- Food --------------------
+type Food {
 	food_id int
-	count int
+	price int
+	stock int
 }
+var foods_cache map[id]Food
+// TODO: weaken the consistency
+func foods(w http.ResponseWriter, r *http.Request) {
+	// check GET
+	token, err := get_token(w, r)
+	if err != nil {
+		return
+	}
+	ret := `[
+	`
+	for id, food := range foods_cache {
+		ret += `{"id": ` + id + `, "price": ` + food.price + `, "stock": ` + food.stock + `},
+		`
+	}
+	ret += `]`
 
-type Cart struct {
-	cart_id string
-	items [3]Item
-	access_token string
+	w.Write(ret.to_bytes())
 }
 
 // TODO: make things async
@@ -155,6 +315,79 @@ type User struct {
 	order Cart // get async
 }
 
+type UserP struct {
+	user_id int
+	password string
+}
+
+var tokens [11001]string
+var userps map[string]UserP
+
+func gen_token() {
+	for i := range(0, 11000) {
+		tokens[i] = RandStringBytes(10);
+	}
+}
+
+// -------------------- MySql --------------------
+var db *sql.DB
+func cache_foods() {
+	var id int
+	var price int
+	var stock int
+	rows, err := db.Query("SELECT id, name, pass FROM food")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		err := rows.Scan(&id, &price, &stock)
+		if err != nil {
+			log.Fatal(err)
+		}
+		foods_cache[id] = {stock, price}
+	}
+	err = rows.Err()
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+func cache_users() {
+	var id int
+	var name string
+	var pass string
+
+	rows, err := db.Query("SELECT id, name, pass FROM user")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		err := rows.Scan(&id, &name, &pass)
+		if err != nil {
+			log.Fatal(err)
+		}
+		userps[name] = {id, pass}
+	}
+	err = rows.Err()
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+func init_mysql() {
+	db, err := sql.Open("mysql", "user:password@/dbname")
+	if err != nil {
+		panic(err.Error())
+	}
+	defer db.Close()
+	err = db.Ping()
+	if err != nil {
+		panic(err.Error())
+	}
+}
+
+
+// -------------------- main --------------------
 // TODO: load foods at boot
 // TODO: maybe: warm up db before starts
 // TODO: make redis no-disk sync
@@ -169,8 +402,10 @@ func main() {
 	}
 	addr := fmt.Sprintf("%s:%s", host, port)
 
-	// access_token User
-	m := make(map[string]User)
+	gen_token()
+	init_mysql()
+	cache_users()
+	cache_foods()
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("hello world!"))
@@ -185,9 +420,26 @@ func main() {
 	http.ListenAndServe(addr, nil)
 }
 
-func getToken(w http.ResponseWrite, r *http.Request) (string, error) {
-	w.Write();
-	return "sdf", nil
+func get_token(w http.ResponseWrite, r *http.Request) (string, error) {
+	token, ok := r.URL.Query()["access_token"]
+	if ok && token != "" {
+		valid := redis_valid_token(token)
+		if valid {
+			return token, nil
+		}
+	}
+	token = r.Header.Get("Access-Token")
+	if token != "" {
+		valid := redis_valid_token(token)
+		if valid {
+			return token, nil
+		}
+	}
+	w.WriteHeader(401)
+	w.Write([]byte(`{
+		"code": "INVALID_ACCESS_TOKEN",
+		"message": "无效的令牌"
+	}`))
 	return nil, new Error()
 }
 
