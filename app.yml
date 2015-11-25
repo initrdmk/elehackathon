@@ -1,3 +1,4 @@
 language: go
 script:
+    - export GOPATH=`pwd`
     - go run main.go
