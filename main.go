@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -29,27 +30,22 @@ func init_redis() {
 	}
 }
 
-func redis_add_token(token string, uid int) {
+type TokenUserCart struct {
+	token   string
+	user_id string
+	cart_id string
+}
+
+func redis_add_tuc(token string, uid string, cart_id string) error {
 	conn, err := redis.Get()
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer redis.Put(conn)
-	if conn.Cmd("SET", "t2u:"+token, uid).Err != nil {
-		log.Fatal(err)
-	}
-}
-
-// TODO: could be pre allocated
-func redis_add_cart(token string, cart_id string) {
-	conn, err := redis.Get()
-	if err != nil {
-		log.Fatal(err)
-	}
-	if conn.Cmd("SET", "t2c:"+token, cart_id).Err != nil {
-		log.Fatal(err)
-	}
-	redis.Put(conn)
+	r := conn.Cmd("MSETNX", "t:"+token, uid+"|"+cart_id,
+		"u:"+uid, token+"|"+cart_id,
+		"c:"+cart_id, "0")
+	return r.Err
 }
 
 type Cart struct {
@@ -58,72 +54,20 @@ type Cart struct {
 	count   int
 }
 
-func redis_get_cart(token string, cart_id string) ([]string, error) {
+// OPT: use token to index carts
+// apply this immediately
+func redis_get_cart(token string) ([]string, error) {
 	conn, err := redis.Get()
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer redis.Put(conn)
-	r := conn.Cmd("SMEMBER", "c:"+cart_id)
-	if r.Err != nil {
-		log.Fatal(err)
-	}
-	return r.List()
-}
-
-func redis_add_to_cart(cart_id string, food_id int, count int) {
-	conn, err := redis.Get()
+	s, err := conn.Cmd("GET", "c:"+token).Str()
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	defer redis.Put(conn)
-	if conn.Cmd("SADD", "c:"+cart_id, food_id).Err != nil {
-		log.Fatal(err)
-	}
-}
-
-func redis_commit_order(token string, cart_id string) error {
-	//err := redis_commmit_order(cart)
-	conn, err := redis.Get()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer redis.Put(conn)
-	r := conn.Cmd("GET", "t2u:"+token)
-	r := conn.Cmd("GET", "t2c:"+token)
-
-	order := fmt.Sprintf(`[{"id": "%s", "user_id":%d, "items":[`, "123", uid)
-	r := conn.Cmd("SMEMBER", "c:"+cart_id)
-	if r.Err != nil {
-		log.Fatal(r.Err)
-	}
-	total := 0
-	for food_id := range r.List() {
-		r = conn.Cmd("SUB", "f:"+food_id)
-		if r.Err != nil {
-			log.Fatal(r.Err)
-		}
-		order += fmt.Sprintf(`{"food_id":%d,"count":%d},`, food_id, count)
-		total += foods_cache[food_id].price * count
-	}
-	order += fmt.Sprintf(`],"total":%d}]`, total)
-	r = conn.Cmd("SET", "o:"+uid, order)
-	if r.Err != nil {
-		log.Fatal(r.Err)
-	}
-	return nil
-}
-
-func redis_get_order(order string) (string, bool) {
-	conn, err := redis.Get()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer redis.Put(conn)
-	if conn.Cmd("GET", "o:"+cart_id, food_id).Err != nil {
-		log.Fatal(err)
-	}
-	return "1", true
+	ss := strings.Split(s, " ")
+	return ss[1:], nil
 }
 
 const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -138,59 +82,55 @@ func RandStringBytes(n int) string {
 
 // -------------------- Login --------------------
 type BodyLogin struct {
-	username string
-	password string
+	Username string
+	Password string
 }
 
 func login(w http.ResponseWriter, r *http.Request) {
 	// check POST
 	//body, err := ioutil.ReadAll(io.LimitReader(r.Body, 1048576))
-	js, err := ioutil.ReadAll(r.Body)
-	if err != nil {
+	js, _ := ioutil.ReadAll(r.Body)
+	if len(js) == 0 {
 		w.WriteHeader(400)
-		w.Write([]byte(`{
-			"code": "EMPTY_REQUEST",
-			"message": "请求体为空"
-		}`))
+		w.Write([]byte(`{"code":"EMPTY_REQUEST","message":"请求体为空"}`))
 		return
 	}
 	var body BodyLogin
 	//if err := r.Body.Close(); err != nil { }
 	if err := json.Unmarshal(js, &body); err != nil {
 		w.WriteHeader(400)
-		w.Write([]byte(`{
-			"code": "MALFORMED_JSON",
-			"message": "格式错误"
-		}`))
+		w.Write([]byte(`{"code":"MALFORMED_JSON","message":"格式错误"}`))
 		return
 	}
 
-	user, ok := userps[body.username]
-	if !ok || user.password != body.password {
+	user, ok := userps[body.Username]
+	//log.Printf("uname: %s; upass: %s; uupass: %s\n", body.Username, user.password, body.Password)
+	if !ok || user.password != body.Password {
 		w.WriteHeader(403)
-		w.Write([]byte(`{
-			"code": "USER_AUTH_FAIL",
-			"message": "用户名或密码错误"
-		}`))
+		w.Write([]byte(`{"code":"USER_AUTH_FAIL","message":"用户名或密码错误"}`))
 		return
 	}
-	token := "token" + RandStringBytes(10)
-	// TODO: multi redis instance, each for one table?
-	redis_add_token(token, user.user_id)
-	w.Write([]byte(fmt.Sprintf(`{
-		"user_id": %d,
-		"username": %s,
-		"access_token": %s
-	}`, user.user_id, body.username, token)))
+	// TODO: check relogin
+	token := "t=" + body.Username
+	cart_id := "c=" + body.Username
+
+	redis_add_tuc(token, user.user_id, cart_id)
+
+	//log.Println("==== ")
+	w.WriteHeader(200)
+	//log.Printf(`{"user_id":%s,"username":"%s","access_token":"%s"}`,
+	//	user.user_id, body.Username, token)
+	w.Write([]byte(fmt.Sprintf(`{"user_id":%s,"username":"%s","access_token":"%s"}`,
+		user.user_id, body.Username, token)))
 }
 
 // -------------------- Cart --------------------
 type BodyCart struct {
-	food_id int
-	count   int
+	Food_id int
+	Count   int
 }
 type BodyCartId struct {
-	cart_id string
+	Cart_id string
 }
 
 func carts(w http.ResponseWriter, r *http.Request) {
@@ -201,23 +141,17 @@ func carts(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
 		post_carts(w, token)
 	} else if r.Method == "PATCH" {
-		js, err := ioutil.ReadAll(r.Body)
-		if err != nil {
+		js, _ := ioutil.ReadAll(r.Body)
+		if len(js) == 0 {
 			w.WriteHeader(400)
-			w.Write([]byte(`{
-				"code": "EMPTY_REQUEST",
-				"message": "请求体为空"
-			}`))
+			w.Write([]byte(`{"code":"EMPTY_REQUEST","message":"请求体为空"}`))
 			return
 		}
 		var body BodyCart
 		//if err := r.Body.Close(); err != nil { }
 		if err := json.Unmarshal(js, &body); err != nil {
 			w.WriteHeader(400)
-			w.Write([]byte(`{
-				"code": "MALFORMED_JSON",
-				"message": "格式错误"
-			}`))
+			w.Write([]byte(`{"code":"MALFORMED_JSON","message":"格式错误"}`))
 			return
 		}
 		cart_id := strings.TrimPrefix(r.RequestURI, "/carts/")
@@ -230,11 +164,22 @@ func carts(w http.ResponseWriter, r *http.Request) {
 }
 
 func post_carts(w http.ResponseWriter, token string) {
-	cart_id := "cart1d" + RandStringBytes(11)
-	redis_add_cart(token, cart_id)
-	w.Write([]byte(fmt.Sprintf(`{
-		"cart_id": %d
-	}`, cart_id)))
+
+	conn, err := redis.Get()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer redis.Put(conn)
+
+	s, err := conn.Cmd("GET", "t:"+token).Str()
+	if err != nil {
+		log.Println(err)
+		w.WriteHeader(401)
+		w.Write([]byte(`{"code":"INVALID_ACCESS_TOKEN","message":"无效的令牌"}`))
+		return
+	}
+
+	w.Write([]byte(fmt.Sprintf(`{"cart_id":"%s"}`, strings.Split(s, "|")[1])))
 }
 
 func patch_carts(
@@ -243,103 +188,145 @@ func patch_carts(
 	cart_id string,
 	body BodyCart) {
 
-	cart := redis_get_cart(token, cart_id)
-	if cart == nil {
-		w.Write([]byte(`{
-			"code": "CART_NOT_FOUND",
-			"message": "篮子不存在"
-		}`))
-		return
+	conn, err := redis.Get()
+	if err != nil {
+		log.Fatal(err)
 	}
-	if token != cart.token {
+	defer redis.Put(conn)
+
+	l, _ := conn.Cmd("MGET", "t:"+token, "c:"+token).List()
+	if l[0] == "" {
 		w.WriteHeader(401)
-		w.Write([]byte(`{
-			"code": "NOT_AUTHORIZED_TO_ACCESS_CART",
-			"message": "无权限访问指定的篮子"
-		}`))
+		w.Write([]byte(`{"code":"INVALID_ACCESS_TOKEN","message":"无效的令牌"}`))
 		return
 	}
-	if cart.count >= 3 {
+	tuc := &TokenUserCart{}
+	tuc.token = token
+	ss := strings.Split(l[0], "|")
+	tuc.user_id = ss[0]
+	tuc.cart_id = ss[1]
+	cart := strings.Split(l[1], " ")
+
+	if false {
+		// never check this
+		w.WriteHeader(404)
+		w.Write([]byte(`{"code":"CART_NOT_FOUND","message":"篮子不存在"}`))
+		return
+	}
+	if tuc.cart_id != cart_id {
+		w.WriteHeader(401)
+		w.Write([]byte(`{"code":"NOT_AUTHORIZED_TO_ACCESS_CART","message":"无权限访问指定的篮子" }`))
+		return
+	}
+	if len(cart) >= 3 {
 		w.WriteHeader(403)
-		w.Write([]byte(`{
-			"code": "FOOD_OUT_OF_LIMIT",
-			"message": "篮子中食物数量超过了三个"
-		}`))
+		w.Write([]byte(`{"code":"FOOD_OUT_OF_LIMIT","message":"篮子中食物数量超过了三个"}`))
 		return
 	}
 
-	_, ok := foods_cache[body.food_id]
+	_, ok := foods_cache[body.Food_id]
 	if !ok {
 		w.WriteHeader(404)
-		w.Write([]byte(`{
-			"code": "FOOD_NOT_FOUND",
-			"message": "食物不存在"
-		}`))
+		w.Write([]byte(`{"code":"FOOD_NOT_FOUND","message":"食物不存在"}`))
 		return
 	}
-	redis_add_to_cart(cart_id, body.food_id, body.count)
+	if conn.Cmd("APPEND", "c:"+token, ""+strconv.Itoa(body.Food_id)).Err != nil {
+		log.Fatal(err)
+	}
 	w.WriteHeader(204)
 }
 
 // -------------------- Order --------------------
 type BodyOrder struct {
-	cart_id string
+	Cart_id string
 }
 
 func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
-	cart := redis_get_cart(token, body.cart_id)
-	if cart == nil {
-		w.WriteHeader(404)
-		w.Write([]byte(`{
-			"code": "CART_NOT_FOUND",
-			"message": "篮子不存在"
-		}`))
+
+	conn, err := redis.Get()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer redis.Put(conn)
+
+	l, _ := conn.Cmd("MGET", "t:"+token, "c:"+token).List()
+	if l[0] == "" {
+		w.WriteHeader(401)
+		w.Write([]byte(`{"code":"INVALID_ACCESS_TOKEN","message":"无效的令牌"}`))
 		return
 	}
-	if token != cart.token {
-		w.WriteHeader(403)
-		w.Write([]byte(`{
-			"code": "NOT_AUTHORIZED_TO_ACCESS_CART",
-			"message": "无权限访问指定的篮子"
-		}`))
-		return
-	}
-	//if token.done {
+	tuc := &TokenUserCart{}
+	tuc.token = token
+	ss := strings.Split(l[0], "|")
+	tuc.user_id = ss[0]
+	tuc.cart_id = ss[1]
+	cart := strings.Split(l[1], " ")
+
 	if false {
+		// never check this
+		w.WriteHeader(404)
+		w.Write([]byte(`{"code":"CART_NOT_FOUND","message":"篮子不存在"}`))
+		return
+	}
+	if tuc.cart_id != body.Cart_id {
+		w.WriteHeader(401)
+		w.Write([]byte(`{"code":"NOT_AUTHORIZED_TO_ACCESS_CART","message":"无权限访问指定的篮子" }`))
+		return
+	}
+	if len(cart) >= 3 {
+		w.WriteHeader(403)
+		w.Write([]byte(`{"code":"FOOD_OUT_OF_LIMIT","message":"篮子中食物数量超过了三个"}`))
+		return
+	}
+
+	// ==================== commit ====================
+	order := fmt.Sprintf(`[{"id":"%s","user_id":%s,"items":[`, "123", tuc.user_id)
+	total := 0
+	//conn.PipeAppend("MULTI")
+	for food_id := range ss {
+		conn.PipeAppend("DECR", "f:"+strconv.Itoa(food_id))
+		// FIXME: check count
+		count := 1
+		order += fmt.Sprintf(`{"food_id":%d,"count":%d},`, food_id, count)
+		total += foods_cache[food_id].price * count
+	}
+	order += fmt.Sprintf(`],"total":%d}]`, total)
+	conn.PipeAppend("SET", "o:"+token, order)
+	for _ = range ss {
+		// FIXME: check insufficient
+		conn.PipeResp()
+	}
+	conn.PipeResp()
+	w.Write([]byte(`{"id ":"0"}`))
+	return
+	if false {
+		// TODO: check duplicate
 		w.WriteHeader(403)
 		w.Write([]byte(`{
 			"code": "ORDER_OUT_OF_LIMIT",
 			"message": "每个用户只能下一单"
 		}`))
 	}
-	err := redis_commit_order(token, body.cart_id)
 	if err != nil {
+		// TODO
 		w.WriteHeader(403)
-		w.Write([]byte(`{
-			"code": "FOOD_OUT_OF_STOCK",
-			"message": "食物库存不足"
-		}`))
+		w.Write([]byte(`{"code": "FOOD_OUT_OF_STOCK","message": "食物库存不足"}`))
 		return
 	}
-
-	w.Write([]byte(`{
-		"id ": "0"
-	}`))
 }
 
 func get_orders(w http.ResponseWriter, token string) {
-	order, ok := token2order[token]
-	if ok {
-		w.Write([]byte(order))
-		return
+	conn, err := redis.Get()
+	if err != nil {
+		log.Fatal(err)
 	}
-	order, ok = redis_get_order("done_order" + token)
-	if ok {
-		token2order[token] = order
-		w.Write([]byte(order))
-		return
+	defer redis.Put(conn)
+	r, err := conn.Cmd("GET", "o:"+token).Str()
+	if err != nil {
+		log.Fatal(err)
 	}
-	w.Write([]byte(""))
+	w.Write([]byte(r))
+	return
 }
 
 func orders(w http.ResponseWriter, r *http.Request) {
@@ -350,23 +337,17 @@ func orders(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		get_orders(w, token)
 	} else if r.Method == "POST" {
-		js, err := ioutil.ReadAll(r.Body)
-		if err != nil {
+		js, _ := ioutil.ReadAll(r.Body)
+		if len(js) == 0 {
 			w.WriteHeader(400)
-			w.Write([]byte(`{
-				"code": "EMPTY_REQUEST",
-				"message": "请求体为空"
-			}`))
+			w.Write([]byte(`{"code":"EMPTY_REQUEST","message":"请求体为空"}`))
 			return
 		}
 		var body BodyOrder
 		//if err := r.Body.Close(); err != nil { }
 		if err := json.Unmarshal(js, &body); err != nil {
 			w.WriteHeader(400)
-			w.Write([]byte(`{
-				"code": "MALFORMED_JSON",
-				"message": "格式错误"
-			}`))
+			w.Write([]byte(`{"code":"MALFORMED_JSON","message":"格式错误"}`))
 			return
 		}
 		post_orders(w, token, body)
@@ -384,6 +365,7 @@ type Food struct {
 }
 
 var foods_cache map[int]Food
+var sorted_foods_keys []int
 
 // TODO: weaken the consistency
 func foods(w http.ResponseWriter, r *http.Request) {
@@ -392,11 +374,16 @@ func foods(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	ret := `[
-	`
-	for id, food := range foods_cache {
-		ret += fmt.Sprintf(`{"id": %d, "price": %d, "stock": %d},
-		`, id, food.price, food.stock)
+	null := true
+	ret := `[`
+	for _, id := range sorted_foods_keys {
+		food := foods_cache[id]
+		if !null {
+			ret += fmt.Sprintf(`,{"id":%d,"price":%d,"stock":%d}`, id, food.price, food.stock)
+		} else {
+			ret += fmt.Sprintf(`{"id":%d,"price":%d,"stock":%d}`, id, food.price, food.stock)
+		}
+		null = false
 	}
 	ret += `]`
 
@@ -415,7 +402,7 @@ type User struct {
 }
 
 type UserP struct {
-	user_id  int
+	user_id  string
 	password string
 }
 
@@ -453,6 +440,11 @@ func cache_foods() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	sorted_foods_keys = make([]int, 0)
+	for k, _ := range foods_cache {
+		sorted_foods_keys = append(sorted_foods_keys, k)
+	}
 	log.Println("food cached")
 }
 func cache_users() {
@@ -471,7 +463,7 @@ func cache_users() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		userps[name] = UserP{id, pass}
+		userps[name] = UserP{strconv.Itoa(id), pass}
 	}
 	err = rows.Err()
 	if err != nil {
@@ -516,6 +508,7 @@ func main() {
 
 	gen_token()
 	init_mysql()
+	init_redis()
 	cache_users()
 	cache_foods()
 
@@ -539,7 +532,7 @@ func redis_valid_token(token string) bool {
 
 func get_token(w http.ResponseWriter, r *http.Request) (string, error) {
 	token := r.URL.Query().Get("access_token")
-	if token != string("") {
+	if token != ("") {
 		valid := redis_valid_token(token)
 		if valid {
 			return token, nil
