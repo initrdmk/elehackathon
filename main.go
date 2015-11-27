@@ -1,14 +1,14 @@
 package main
 
 import (
-	"fmt"
-	"net/http"
-	"os"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"math/rand"
+	"net/http"
+	"os"
 	"strings"
-	"errors"
 )
 
 import "io/ioutil"
@@ -18,11 +18,12 @@ import _ "github.com/go-sql-driver/mysql"
 
 // -------------------- Redis --------------------
 var redis *pool.Pool
+
 func init_redis() {
 	var err error
 	host := os.Getenv("REDIS_HOST")
 	port := os.Getenv("REDIS_PORT")
-	redis, err = pool.New("tcp", host + ":" + port, 10)
+	redis, err = pool.New("tcp", host+":"+port, 10)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -33,18 +34,19 @@ func redis_add_token(token string, uid int) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if conn.Cmd("PUT", token, uid).Err != nil {
+	defer redis.Put(conn)
+	if conn.Cmd("SET", "t2u:"+token, uid).Err != nil {
 		log.Fatal(err)
 	}
-	redis.Put(conn)
 }
 
+// TODO: could be pre allocated
 func redis_add_cart(token string, cart_id string) {
 	conn, err := redis.Get()
 	if err != nil {
 		log.Fatal(err)
 	}
-	if conn.Cmd("PUT", token, cart_id).Err != nil {
+	if conn.Cmd("SET", "t2c:"+token, cart_id).Err != nil {
 		log.Fatal(err)
 	}
 	redis.Put(conn)
@@ -52,37 +54,80 @@ func redis_add_cart(token string, cart_id string) {
 
 type Cart struct {
 	cart_id string
-	token string
-	count int
+	token   string
+	count   int
 }
 
-func redis_get_cart(token string, cart_id string) *Cart {
-	return nil
+func redis_get_cart(token string, cart_id string) ([]string, error) {
+	conn, err := redis.Get()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer redis.Put(conn)
+	r := conn.Cmd("SMEMBER", "c:"+cart_id)
+	if r.Err != nil {
+		log.Fatal(err)
+	}
+	return r.List()
 }
 
 func redis_add_to_cart(cart_id string, food_id int, count int) {
-	
+	conn, err := redis.Get()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer redis.Put(conn)
+	if conn.Cmd("SADD", "c:"+cart_id, food_id).Err != nil {
+		log.Fatal(err)
+	}
 }
 
-func redis_commit_order(cart *Cart) error {
+func redis_commit_order(token string, cart_id string) error {
 	//err := redis_commmit_order(cart)
+	conn, err := redis.Get()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer redis.Put(conn)
+	r := conn.Cmd("GET", "t2u:"+token)
+	r := conn.Cmd("GET", "t2c:"+token)
+
+	order := fmt.Sprintf(`[{"id": "%s", "user_id":%d, "items":[`, "123", uid)
+	r := conn.Cmd("SMEMBER", "c:"+cart_id)
+	if r.Err != nil {
+		log.Fatal(r.Err)
+	}
+	total := 0
+	for food_id := range r.List() {
+		r = conn.Cmd("SUB", "f:"+food_id)
+		if r.Err != nil {
+			log.Fatal(r.Err)
+		}
+		order += fmt.Sprintf(`{"food_id":%d,"count":%d},`, food_id, count)
+		total += foods_cache[food_id].price * count
+	}
+	order += fmt.Sprintf(`],"total":%d}]`, total)
+	r = conn.Cmd("SET", "o:"+uid, order)
+	if r.Err != nil {
+		log.Fatal(r.Err)
+	}
 	return nil
 }
 
 func redis_get_order(order string) (string, bool) {
+	conn, err := redis.Get()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer redis.Put(conn)
+	if conn.Cmd("GET", "o:"+cart_id, food_id).Err != nil {
+		log.Fatal(err)
+	}
 	return "1", true
-
 }
-func redis_set(key string, value string) {
-
-}
-
-func redis_get(key string) {
-
-}
-
 
 const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
 func RandStringBytes(n int) string {
 	b := make([]byte, n)
 	for i := range b {
@@ -91,12 +136,12 @@ func RandStringBytes(n int) string {
 	return string(b)
 }
 
-
 // -------------------- Login --------------------
 type BodyLogin struct {
 	username string
 	password string
 }
+
 func login(w http.ResponseWriter, r *http.Request) {
 	// check POST
 	//body, err := ioutil.ReadAll(io.LimitReader(r.Body, 1048576))
@@ -109,7 +154,7 @@ func login(w http.ResponseWriter, r *http.Request) {
 		}`))
 		return
 	}
-	var body BodyLogin;
+	var body BodyLogin
 	//if err := r.Body.Close(); err != nil { }
 	if err := json.Unmarshal(js, &body); err != nil {
 		w.WriteHeader(400)
@@ -142,11 +187,12 @@ func login(w http.ResponseWriter, r *http.Request) {
 // -------------------- Cart --------------------
 type BodyCart struct {
 	food_id int
-	count int
+	count   int
 }
 type BodyCartId struct {
 	cart_id string
 }
+
 func carts(w http.ResponseWriter, r *http.Request) {
 	token, err := get_token(w, r)
 	if err != nil {
@@ -164,7 +210,7 @@ func carts(w http.ResponseWriter, r *http.Request) {
 			}`))
 			return
 		}
-		var body BodyCart;
+		var body BodyCart
 		//if err := r.Body.Close(); err != nil { }
 		if err := json.Unmarshal(js, &body); err != nil {
 			w.WriteHeader(400)
@@ -239,6 +285,7 @@ func patch_carts(
 type BodyOrder struct {
 	cart_id string
 }
+
 func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 	cart := redis_get_cart(token, body.cart_id)
 	if cart == nil {
@@ -265,8 +312,8 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 			"message": "每个用户只能下一单"
 		}`))
 	}
-	err := redis_commit_order(cart)
-	if  err != nil {
+	err := redis_commit_order(token, body.cart_id)
+	if err != nil {
 		w.WriteHeader(403)
 		w.Write([]byte(`{
 			"code": "FOOD_OUT_OF_STOCK",
@@ -281,7 +328,7 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 }
 
 func get_orders(w http.ResponseWriter, token string) {
-	order, ok := token2order[token];
+	order, ok := token2order[token]
 	if ok {
 		w.Write([]byte(order))
 		return
@@ -312,7 +359,7 @@ func orders(w http.ResponseWriter, r *http.Request) {
 			}`))
 			return
 		}
-		var body BodyOrder;
+		var body BodyOrder
 		//if err := r.Body.Close(); err != nil { }
 		if err := json.Unmarshal(js, &body); err != nil {
 			w.WriteHeader(400)
@@ -331,12 +378,13 @@ func orders(w http.ResponseWriter, r *http.Request) {
 
 // -------------------- Food --------------------
 type Food struct {
-//	food_id int
+	//	food_id int
 	price int
 	stock int
 }
 
 var foods_cache map[int]Food
+
 // TODO: weaken the consistency
 func foods(w http.ResponseWriter, r *http.Request) {
 	// check GET
@@ -358,16 +406,16 @@ func foods(w http.ResponseWriter, r *http.Request) {
 // TODO: make things async
 //  e.g. use goroutine to calc `total`
 type User struct {
-	user_id int
+	user_id  int
 	username string
 	// access_token string // hidden to map key
-	done bool
+	done  bool
 	total int
 	//order Cart // get async
 }
 
 type UserP struct {
-	user_id int
+	user_id  int
 	password string
 }
 
@@ -376,13 +424,14 @@ var userps map[string]UserP
 var token2order map[string]string
 
 func gen_token() {
-	for i := 0; i<11001; i++ {
-		tokens[i] = RandStringBytes(10);
+	for i := 0; i < 11001; i++ {
+		tokens[i] = RandStringBytes(10)
 	}
 }
 
 // -------------------- MySql --------------------
 var db *sql.DB
+
 func cache_foods() {
 	var id int
 	var price int
@@ -428,7 +477,7 @@ func cache_users() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Println("user cached");
+	log.Println("user cached")
 }
 func init_mysql() {
 	host := os.Getenv("DB_HOST")
@@ -438,8 +487,8 @@ func init_mysql() {
 	pass := os.Getenv("DB_PASS")
 	var err error
 	db, err = sql.Open("mysql",
-		user + ":" + pass + "@tcp(" +
-		host + ":" + port + ")/" + name)
+		user+":"+pass+"@tcp("+
+			host+":"+port+")/"+name)
 	if err != nil {
 		panic(err.Error())
 	}
@@ -449,7 +498,6 @@ func init_mysql() {
 		panic(err.Error())
 	}
 }
-
 
 // -------------------- main --------------------
 // TODO: load foods at boot
