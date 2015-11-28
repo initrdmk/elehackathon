@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -20,6 +21,8 @@ import "github.com/mediocregopher/radix.v2/pool"
 import "database/sql"
 import _ "github.com/go-sql-driver/mysql"
 
+const debug = false
+
 // -------------------- Redis --------------------
 var redis *pool.Pool
 
@@ -27,12 +30,14 @@ func init_redis() {
 	var err error
 	host := os.Getenv("REDIS_HOST")
 	port := os.Getenv("REDIS_PORT")
-	redis, err = pool.New("tcp", host+":"+port, 10)
+	redis, err = pool.New("tcp", host+":"+port, 1024)
 	if err != nil {
+		log.Println("init_redis")
 		log.Fatal(err)
 	}
 	conn, err := redis.Get()
 	if err != nil {
+		log.Println("init_redis")
 		log.Fatal(err)
 	}
 	defer redis.Put(conn)
@@ -51,34 +56,22 @@ type Cart struct {
 	count   int
 }
 
-// OPT: use token to index carts
-// apply this immediately
-func redis_get_cart(token string) ([]string, error) {
-	conn, err := redis.Get()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer redis.Put(conn)
-	s, err := conn.Cmd("GET", "c:"+token).Str()
-	if err != nil {
-		return nil, err
-	}
-	ss := strings.Split(s, " ")
-	return ss[1:], nil
-}
-
 // -------------------- Login --------------------
 type BodyLogin struct {
 	Username string
 	Password string
 }
 
-var root_token string
+var root_uid string
 
 func login(w http.ResponseWriter, r *http.Request) {
 	// check POST
 	//body, err := ioutil.ReadAll(io.LimitReader(r.Body, 1048576))
-	js, _ := ioutil.ReadAll(r.Body)
+	js, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		log.Println("login:")
+		log.Fatal(err)
+	}
 	if len(js) == 0 {
 		w.WriteHeader(400)
 		w.Write([]byte(`{"code":"EMPTY_REQUEST","message":"请求体为空"}`))
@@ -87,6 +80,9 @@ func login(w http.ResponseWriter, r *http.Request) {
 	var body BodyLogin
 	//if err := r.Body.Close(); err != nil { }
 	if err := json.Unmarshal(js, &body); err != nil {
+		if debug {
+			log.Println("login: 400")
+		}
 		w.WriteHeader(400)
 		w.Write([]byte(`{"code":"MALFORMED_JSON","message":"格式错误"}`))
 		return
@@ -95,6 +91,9 @@ func login(w http.ResponseWriter, r *http.Request) {
 	user, ok := userps[body.Username]
 	//log.Printf("uname: %s; upass: %s; uupass: %s\n", body.Username, user.password, body.Password)
 	if !ok || user.password != body.Password {
+		if debug {
+			log.Println("login: 403")
+		}
 		w.WriteHeader(403)
 		w.Write([]byte(`{"code":"USER_AUTH_FAIL","message":"用户名或密码错误"}`))
 		return
@@ -105,13 +104,11 @@ func login(w http.ResponseWriter, r *http.Request) {
 
 	conn, err := redis.Get()
 	if err != nil {
+		log.Println("login:")
 		log.Fatal(err)
 	}
 	defer redis.Put(conn)
 	conn.Cmd("MSETNX", "t:"+token, user.user_id, "u:"+user.user_id, token)
-	if body.Username == "root" {
-		root_token = token
-	}
 
 	//log.Println("==== ")
 	w.WriteHeader(200)
@@ -133,7 +130,9 @@ type BodyCartId struct {
 func carts(w http.ResponseWriter, r *http.Request) {
 	token, err := get_token(w, r)
 	if err != nil {
-		log.Println("error")
+		if debug {
+			log.Println("error in carts")
+		}
 		return
 	}
 	if r.Method == "POST" {
@@ -156,7 +155,7 @@ func carts(w http.ResponseWriter, r *http.Request) {
 		cart_id := strings.Split(suffix, "?")[0]
 
 		if !strings.HasPrefix(cart_id, "c=") {
-			println(404)
+			//println(404)
 			w.WriteHeader(404)
 			w.Write([]byte(`{"code":"CART_NOT_FOUND","message":"篮子不存在"}`))
 			return
@@ -175,13 +174,16 @@ func post_carts(w http.ResponseWriter, token string) {
 
 	conn, err := redis.Get()
 	if err != nil {
+		log.Println("post_cart")
 		log.Fatal(err)
 	}
 	defer redis.Put(conn)
 
 	user_id, err := conn.Cmd("GET", "t:"+token).Str()
 	if err != nil {
-		log.Println(err)
+		if debug {
+			log.Println(err)
+		}
 		w.WriteHeader(401)
 		w.Write([]byte(`{"code":"INVALID_ACCESS_TOKEN","message":"无效的令牌"}`))
 		return
@@ -200,12 +202,17 @@ func patch_carts(
 
 	conn, err := redis.Get()
 	if err != nil {
+		log.Println("patch_cart")
 		log.Fatal(err)
 	}
 	defer redis.Put(conn)
 
-	l, _ := conn.Cmd("MGET", "t:"+token, "c:"+cart_id).List()
+	l, err := conn.Cmd("MGET", "t:"+token, "c:"+cart_id).List()
 	//fmt.Printf("[%s %s] %+v\n", token, cart_id, l)
+	if err != nil {
+		log.Println("patch_cart")
+		log.Fatal(err)
+	}
 	if l[0] == "" {
 		w.WriteHeader(401)
 		w.Write([]byte(`{"code":"INVALID_ACCESS_TOKEN","message":"无效的令牌"}`))
@@ -219,6 +226,13 @@ func patch_carts(
 	user_id := l[0]
 	cart := strings.Split(l[1], " ")
 	cart_user_id := cart[0]
+
+	if user_id != cart_user_id {
+		w.WriteHeader(401)
+		w.Write([]byte(`{"code":"NOT_AUTHORIZED_TO_ACCESS_CART","message":"无权限访问指定的篮子" }`))
+		return
+	}
+
 	tot_count := 0
 	for _, food_str := range cart[1:] {
 		ll := len(food_str)
@@ -231,11 +245,6 @@ func patch_carts(
 		}
 	}
 
-	if user_id != cart_user_id {
-		w.WriteHeader(401)
-		w.Write([]byte(`{"code":"NOT_AUTHORIZED_TO_ACCESS_CART","message":"无权限访问指定的篮子" }`))
-		return
-	}
 	//fmt.Printf("%+v\n", cart)
 	if tot_count+body.Count > 3 {
 		w.WriteHeader(403)
@@ -251,10 +260,12 @@ func patch_carts(
 	}
 	if body.Count == 1 {
 		if conn.Cmd("APPEND", "c:"+cart_id, " "+strconv.Itoa(body.Food_id)).Err != nil {
+			log.Println("patch_cart")
 			log.Fatal(err)
 		}
 	} else {
 		if conn.Cmd("APPEND", "c:"+cart_id, " "+strconv.Itoa(body.Food_id)+"*"+string(body.Count+'0')).Err != nil {
+			log.Println("patch_cart")
 			log.Fatal(err)
 		}
 	}
@@ -271,6 +282,7 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 
 	conn, err := redis.Get()
 	if err != nil {
+		log.Println("post_orders")
 		log.Fatal(err)
 	}
 	defer redis.Put(conn)
@@ -347,6 +359,7 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 		go func(cart []string, counts []int, token string) {
 			conn, err := redis.Get()
 			if err != nil {
+				log.Println("post_orders")
 				log.Fatal(err)
 			}
 			defer redis.Put(conn)
@@ -371,6 +384,7 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 func get_orders(w http.ResponseWriter, token string) {
 	conn, err := redis.Get()
 	if err != nil {
+		log.Println("get_orders")
 		log.Fatal(err)
 	}
 	defer redis.Put(conn)
@@ -417,17 +431,25 @@ func admin_orders(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	if token != root_token {
+	conn, err := redis.Get()
+	if err != nil {
+		log.Println("admin_orders")
+		log.Fatal(err)
+	}
+	defer redis.Put(conn)
+
+	user_id, err := conn.Cmd("GET", "t:"+token).Str()
+	if err != nil || user_id == "" {
+		w.WriteHeader(401)
+		w.Write([]byte(`{"code":"INVALID_ACCESS_TOKEN","message":"无效的令牌"}`))
+		return
+	}
+	if user_id != root_uid {
 		w.WriteHeader(401)
 		w.Write([]byte(`{"code":"INVALID_ACCESS_TOKEN","message":"无效的令牌"}`))
 		return
 	}
 
-	conn, err := redis.Get()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer redis.Put(conn)
 	keys, _ := conn.Cmd("KEYS", "o:*").List()
 	if len(keys) == 0 {
 		w.Write([]byte("[]"))
@@ -540,6 +562,7 @@ func cache_foods() {
 	foods_cache = map[int]Food{}
 	rows, err := db.Query("SELECT id, stock, price FROM food")
 	if err != nil {
+		log.Println("cache_foods")
 		log.Fatal(err)
 	}
 	defer rows.Close()
@@ -547,12 +570,14 @@ func cache_foods() {
 	for rows.Next() {
 		err := rows.Scan(&id, &price, &stock)
 		if err != nil {
+			log.Println("cache_foods")
 			log.Fatal(err)
 		}
 		foods_cache[id] = Food{stock, price}
 	}
 	err = rows.Err()
 	if err != nil {
+		log.Println("cache_foods")
 		log.Fatal(err)
 	}
 
@@ -560,9 +585,11 @@ func cache_foods() {
 	for k, _ := range foods_cache {
 		sorted_foods_keys = append(sorted_foods_keys, k)
 	}
+	sort.Ints(sorted_foods_keys)
 
 	conn, err := redis.Get()
 	if err != nil {
+		log.Println("cache_foods")
 		log.Fatal(err)
 	}
 	defer redis.Put(conn)
@@ -579,18 +606,24 @@ func cache_users() {
 
 	rows, err := db.Query("SELECT id, name, password FROM user")
 	if err != nil {
+		log.Println("cache_users")
 		log.Fatal(err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		err := rows.Scan(&id, &name, &pass)
 		if err != nil {
+			log.Println("cache_users")
 			log.Fatal(err)
 		}
 		userps[name] = UserP{strconv.Itoa(id), pass}
+		if name == "root" {
+			root_uid = strconv.Itoa(id)
+		}
 	}
 	err = rows.Err()
 	if err != nil {
+		log.Println("cache_users")
 		log.Fatal(err)
 	}
 	log.Println("user cached")
@@ -630,6 +663,17 @@ func main() {
 		port = "8080"
 	}
 	addr := fmt.Sprintf("%s:%s", host, port)
+
+	f, _ := os.Open("/dev/urandom")
+	b := make([]byte, 8)
+	f.Read(b)
+	f.Close()
+	var seed int64 = 0
+	for _, v := range b {
+		seed <<= 8
+		seed |= int64(v)
+	}
+	rand.Seed(seed)
 
 	gen_token()
 	init_mysql()
