@@ -30,7 +30,7 @@ func init_redis() {
 	var err error
 	host := os.Getenv("REDIS_HOST")
 	port := os.Getenv("REDIS_PORT")
-	redis, err = pool.New("tcp", host+":"+port, 1024)
+	redis, err = pool.New("tcp", host+":"+port, 512)
 	if err != nil {
 		log.Println("init_redis")
 		log.Fatal(err)

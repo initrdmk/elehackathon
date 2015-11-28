@@ -1,3 +1,4 @@
 language: go
 script:
+#    - sudo sysctl fs.file-max=2097152
     - GOPATH=`pwd` go run main.go
