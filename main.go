@@ -227,7 +227,7 @@ func init_redis() {
 			if r.Channel == "signal" {
 				// FIXME: signal should be separated
 				//log.Println("signal received")
-				//signal <- 1
+				signal <- 1
 			} else if r.Channel == "food" {
 				food_id, _ := strconv.Atoi(r.Message)
 				var old *int32
@@ -261,6 +261,10 @@ func init_redis() {
 			}
 		}
 	}()
+	conn.Cmd("PUBLISH", "signal", "go")
+	for sig_i := 0; sig_i < NR_PEERS; sig_i++ {
+		<-signal
+	}
 
 	log.Println("redis ok")
 }
@@ -844,7 +848,7 @@ func cache_foods() {
 		conn.Cmd("SETNX", "f:"+strconv.Itoa(k)+":", v.stock)
 	}
 	for k, v := range foods_cache {
-		var p int32 = int32(v.stock) / 3
+		var p int32 = int32(v.stock) / int32(NR_PEERS)
 		local_foods[k] = &p
 		r := conn.Cmd("DECRBY", "f:"+strconv.Itoa(k)+":", *local_foods[k])
 		if r.Err != nil {
@@ -852,6 +856,11 @@ func cache_foods() {
 		}
 	}
 	log.Println("food cached")
+	conn.Cmd("PUBLISH", "signal", "go")
+	for sig_i := 0; sig_i < NR_PEERS; sig_i++ {
+		<-signal
+	}
+	log.Println("all food cached")
 
 }
 func cache_users() {
@@ -896,6 +905,11 @@ func cache_users() {
 		}
 	}
 	log.Println("user warmed")
+	conn.Cmd("PUBLISH", "signal", "go")
+	for sig_i := 0; sig_i < NR_PEERS; sig_i++ {
+		<-signal
+	}
+	log.Println("all cart warmed")
 	for k, v := range userps {
 		token, err := conn.Cmd("GET", "u:"+v.user_id).Str()
 		if err != nil {
@@ -953,6 +967,11 @@ func cache_users() {
 		}
 	}
 	log.Println("cart warmed")
+	conn.Cmd("PUBLISH", "signal", "go")
+	for sig_i := 0; sig_i < NR_PEERS; sig_i++ {
+		<-signal
+	}
+	log.Println("all cart warmed")
 }
 
 func init_mysql() {
