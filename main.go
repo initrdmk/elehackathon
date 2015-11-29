@@ -26,11 +26,13 @@ import "database/sql"
 import _ "github.com/go-sql-driver/mysql"
 
 const debug = false
-const NR_PEERS = 3
+
+var NR_PEERS int = 1
 
 // -------------------- Global --------------------
 var seed int64 = 0
 var ticker *time.Ticker
+var nticker *time.Ticker
 
 // -------------------- Redis --------------------
 var redis_pool *pool.Pool
@@ -195,20 +197,27 @@ func init_redis() {
 	if conn.Cmd("INCR", "SIGNAL").Err != nil {
 		log.Fatal("add signal")
 	}
-	for {
-		num, err := conn.Cmd("GET", "SIGNAL").Int()
+
+	nticker = time.NewTicker(time.Millisecond * 200)
+	go func() {
+		conn, err := redis_pool.Get()
 		if err != nil {
 			log.Fatal(err)
 		}
-		if num > NR_PEERS {
-			log.Fatal("TOO MANY")
+		defer redis_pool.Put(conn)
+		for _ = range nticker.C {
+			num, err := conn.Cmd("GET", "SIGNAL").Int()
+			if err != nil {
+				log.Fatal(err)
+			}
+			if num > NR_PEERS {
+				NR_PEERS = num
+			}
+			if NR_PEERS == 3 {
+				return
+			}
 		}
-		if num == NR_PEERS {
-			break
-		}
-		//log.Println("waiting for peers...")
-		runtime.Gosched()
-	}
+	}()
 
 	go func() {
 		conn, err := redis_pool.Get()
@@ -230,7 +239,7 @@ func init_redis() {
 			if r.Channel == "signal" {
 				// FIXME: signal should be separated
 				//log.Println("signal received")
-				signal <- 1
+				//signal <- 1
 			} else if r.Channel == "food" {
 				food_id, _ := strconv.Atoi(r.Message)
 				var old *int32
@@ -265,14 +274,6 @@ func init_redis() {
 		}
 	}()
 
-	// just try it to (useless) warm up 2333
-	conn.Cmd("PUBLISH", "signal", "go")
-	log.Println("signal published")
-	for sig_i := 0; sig_i < NR_PEERS; sig_i++ {
-		log.Println("waiting")
-		<-signal
-		log.Println("waited")
-	}
 	log.Println("redis ok")
 }
 
@@ -853,7 +854,7 @@ func cache_foods() {
 		conn.Cmd("SETNX", "f:"+strconv.Itoa(k)+":", v.stock)
 	}
 	for k, v := range foods_cache {
-		var p int32 = int32(v.stock) / NR_PEERS
+		var p int32 = int32(v.stock) / 3
 		local_foods[k] = &p
 		r := conn.Cmd("DECRBY", "f:"+strconv.Itoa(k)+":", *local_foods[k])
 		if r.Err != nil {
@@ -862,11 +863,6 @@ func cache_foods() {
 	}
 	log.Println("food cached")
 
-	conn.Cmd("PUBLISH", "signal", "go")
-	for sig_i := 0; sig_i < NR_PEERS; sig_i++ {
-		<-signal
-	}
-	log.Println("all food cached")
 }
 func cache_users() {
 	var id int
@@ -937,11 +933,6 @@ func cache_users() {
 		}
 	}
 	log.Println("cart warmed")
-	conn.Cmd("PUBLISH", "signal", "go")
-	for sig_i := 0; sig_i < NR_PEERS; sig_i++ {
-		<-signal
-	}
-	log.Println("all cart warmed")
 	for _, v := range userps {
 		var carts []string
 		var err error
@@ -950,11 +941,13 @@ func cache_users() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		if len(carts) < NR_PEERS {
-			log.Printf("%s %+v\n", v.user_id, carts)
-			log.Fatal("too small")
-			break
-		}
+		/*
+			if len(carts) < NR_PEERS {
+				log.Printf("%s %+v\n", v.user_id, carts)
+				log.Fatal("too small")
+				break
+			}
+		*/
 		for _, cart := range carts {
 			cart2token[cart[2:]] = token
 			//conn.Cmd("SET", "debug:cart2token="+cart[2:], token)
@@ -970,11 +963,6 @@ func cache_users() {
 		}
 	}
 	log.Println("cart warmed")
-	conn.Cmd("PUBLISH", "signal", "go")
-	for sig_i := 0; sig_i < NR_PEERS; sig_i++ {
-		<-signal
-	}
-	log.Println("all cart warmed")
 }
 
 func init_mysql() {
@@ -1026,6 +1014,7 @@ func main() {
 	gen_token()
 	init_mysql()
 	init_redis()
+
 	cache_users()
 	cache_foods()
 
@@ -1047,7 +1036,7 @@ func main() {
 		for _ = range ticker.C {
 			//log.Println("doing... ")
 			for _, id := range sorted_foods_keys {
-				conn.PipeAppend("SET", "f:"+strconv.Itoa(id)+":"+strconv.Itoa(int(seed % 1008611)), *local_foods[id])
+				conn.PipeAppend("SET", "f:"+strconv.Itoa(id)+":"+strconv.Itoa(int(seed%1008611)), *local_foods[id])
 			}
 			for _ = range sorted_foods_keys {
 				conn.PipeResp()
