@@ -943,6 +943,7 @@ func cache_users() {
 			}
 			// set mine
 			token2carts[v.token].cart_id = cart_id
+			conn.Cmd("LPUSH", "u2c:"+v.user_id, cart_id)
 			break
 		}
 	}
@@ -960,7 +961,7 @@ func cache_users() {
 	log.Println("all cart warmed")
 	for _, k := range sorted_users_keys {
 		v := userps[k]
-		conn.PipeAppend("KEYS", "c:"+v.user_id+"_*")
+		conn.PipeAppend("LRANGE", "u2c:"+v.user_id, 0, -1)
 	}
 	for _, k := range sorted_users_keys {
 		var carts []string
@@ -979,7 +980,7 @@ func cache_users() {
 			}
 		*/
 		for _, cart := range carts {
-			cart2token[cart[2:]] = token
+			cart2token[cart] = token
 			//conn.Cmd("SET", "debug:cart2token="+cart[2:], token)
 			/*
 				for i, _ := range token2carts[token].cart_ids {
