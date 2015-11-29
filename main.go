@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	//	"github.com/julienschmidt/httprouter"
 )
 
@@ -28,6 +29,9 @@ const debug = false
 const NR_PEERS = 3
 
 // -------------------- Global --------------------
+var seed int64 = 0
+var ticker *time.Ticker
+
 // -------------------- Redis --------------------
 var redis_pool *pool.Pool
 var redis_subpub *redis.Client
@@ -245,7 +249,7 @@ func init_redis() {
 						//log.Println("cas failed, retrying...")
 						continue
 					}
-					if conn.Cmd("INCRBY", "f:"+strconv.Itoa(food_id), oldv).Err != nil {
+					if conn.Cmd("INCRBY", "f:"+strconv.Itoa(food_id)+":", oldv).Err != nil {
 						log.Fatal("food INC")
 					}
 					*old = -1
@@ -631,7 +635,7 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 		if local_done[i] {
 			continue
 		}
-		conn.PipeAppend("DECRBY", "f:"+food_str, counts[i])
+		conn.PipeAppend("DECRBY", "f:"+food_str+":", counts[i])
 	}
 	conn.PipeAppend("SETNX", "o:"+token, order)
 	succ := true
@@ -666,7 +670,7 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 				if counts[i] == 0 {
 					continue
 				}
-				conn.PipeAppend("INCRBY", "f:"+food_str, counts[i])
+				conn.PipeAppend("INCRBY", "f:"+food_str+":", counts[i])
 			}
 			if del {
 				conn.PipeAppend("DEL", "o:"+token)
@@ -846,12 +850,12 @@ func cache_foods() {
 	}
 	defer redis_pool.Put(conn)
 	for k, v := range foods_cache {
-		conn.Cmd("SETNX", "f:"+strconv.Itoa(k), v.stock)
+		conn.Cmd("SETNX", "f:"+strconv.Itoa(k)+":", v.stock)
 	}
 	for k, v := range foods_cache {
 		var p int32 = int32(v.stock) / NR_PEERS
 		local_foods[k] = &p
-		r := conn.Cmd("DECRBY", "f:"+strconv.Itoa(k), *local_foods[k])
+		r := conn.Cmd("DECRBY", "f:"+strconv.Itoa(k)+":", *local_foods[k])
 		if r.Err != nil {
 			log.Fatal(r)
 		}
@@ -1011,7 +1015,8 @@ func main() {
 	b := make([]byte, 8)
 	f.Read(b)
 	f.Close()
-	var seed int64 = 0
+	//var seed int64 = 0
+	seed = 0
 	for _, v := range b {
 		seed <<= 8
 		seed |= int64(v)
@@ -1032,6 +1037,40 @@ func main() {
 	http.HandleFunc("/orders", orders)
 	http.HandleFunc("/admin/orders", admin_orders)
 
+	ticker = time.NewTicker(time.Second * 30)
+	go func() {
+		conn, err := redis_pool.Get()
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer redis_pool.Put(conn)
+		for _ = range ticker.C {
+			//log.Println("doing... ")
+			for _, id := range sorted_foods_keys {
+				conn.PipeAppend("SET", "f:"+strconv.Itoa(id)+":"+strconv.Itoa(int(seed % 1008611)), *local_foods[id])
+			}
+			for _ = range sorted_foods_keys {
+				conn.PipeResp()
+			}
+			for _, id := range sorted_foods_keys {
+				list, err := conn.Cmd("KEYS", "f:"+strconv.Itoa(id)+":*").List()
+				if err != nil {
+					log.Println(err)
+				}
+				num, err := conn.Cmd("MGET", list).List()
+				if err != nil {
+					log.Println(err)
+				}
+				tot := 0
+				for _, v := range num {
+					vv, _ := strconv.Atoi(v)
+					tot += vv
+				}
+				foods_cache[id].stock = tot
+			}
+			//log.Println("done.")
+		}
+	}()
 	log.Println("serving...")
 	http.ListenAndServe(addr, nil)
 }
