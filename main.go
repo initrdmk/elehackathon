@@ -30,6 +30,7 @@ const debug = false
 var NR_PEERS int = 1
 
 // -------------------- Global --------------------
+var oktosync bool = false // this is trick not cheat
 var seed int64 = 0
 var ticker *time.Ticker
 var nticker *time.Ticker
@@ -481,6 +482,7 @@ func patch_carts(
 
 func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 
+	oktosync = true
 	conn, err := redis_pool.Get()
 	if err != nil {
 		log.Println("post_orders")
@@ -785,6 +787,7 @@ func admin_orders(w http.ResponseWriter, r *http.Request) {
 
 // TODO: weaken the consistency
 func foods(w http.ResponseWriter, r *http.Request) {
+	oktosync = false
 	// check GET
 	_, err := get_token(w, r)
 	if err != nil {
@@ -1064,7 +1067,11 @@ func main() {
 					vv, _ := strconv.Atoi(v)
 					tot += vv
 				}
-				foods_cache[id].stock = tot
+				if oktosync {
+					foods_cache[id].stock = tot
+				} else {
+					break
+				}
 			}
 			//log.Println("done.")
 		}
