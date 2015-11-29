@@ -25,13 +25,130 @@ import "database/sql"
 import _ "github.com/go-sql-driver/mysql"
 
 const debug = false
+const NR_PEERS = 1
 
 // -------------------- Global --------------------
 // -------------------- Redis --------------------
 var redis_pool *pool.Pool
 var redis_subpub *redis.Client
 var redis_sub *pubsub.SubClient
-var signal chan int
+
+// FIXME: need to separate
+var signal chan int = make(chan int, 1)
+
+// -------------------- Login --------------------
+type BodyLogin struct {
+	Username string
+	Password string
+}
+
+var root_uid string
+
+// -------------------- Cart --------------------
+type BodyCart struct {
+	Food_id int
+	Count   int
+}
+type BodyCartId struct {
+	Cart_id string
+}
+
+// -------------------- Order --------------------
+type BodyOrder struct {
+	Cart_id string
+}
+
+var token2uid map[string]string = make(map[string]string)
+
+type Carts struct {
+	// [0] is mine
+	cart_ids [3]string
+	used     bool
+}
+
+var token2carts map[string]*Carts = make(map[string]*Carts)
+var cart2token map[string]string = make(map[string]string)
+
+var cart2token_ext_rwmutex sync.RWMutex
+var cart2token_ext map[string]string = make(map[string]string)
+
+// -------------------- Food --------------------
+type Food struct {
+	//	food_id int
+	price int
+	stock int
+}
+
+//var done_orders map[string]string
+var foods_cache map[int]*Food = make(map[int]*Food)
+var local_foods map[int]*int32 = make(map[int]*int32)
+var sorted_foods_keys []int
+
+type UserP struct {
+	user_id  string
+	password string
+	token    string
+}
+
+const TOKEN_COUNT = 301001
+const TOKEN_LEN = 24
+
+var tokens [TOKEN_COUNT]string
+var userps map[string]*UserP = make(map[string]*UserP)
+var token2order map[string]string = make(map[string]string)
+
+const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+func RandStringBytes(n int) string {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = letters[rand.Intn(len(letters))]
+	}
+	return string(b)
+}
+
+var randp int64
+
+func gen_token() {
+	for i := 0; i < TOKEN_COUNT; i++ {
+		tokens[i] = RandStringBytes(TOKEN_LEN)
+	}
+	randp = 0
+}
+func raw_next_rand_less() string {
+	if TOKEN_LEN < 0 {
+		return RandStringBytes(TOKEN_LEN)
+	}
+	return RandStringBytes(TOKEN_LEN - 4)
+}
+
+func raw_next_rand() string {
+	return RandStringBytes(TOKEN_LEN)
+}
+func nextRand() string {
+	got := atomic.AddInt64(&randp, 1)
+	if got >= TOKEN_COUNT {
+		return RandStringBytes(TOKEN_LEN)
+	}
+	return tokens[got]
+}
+
+func get_token(w http.ResponseWriter, r *http.Request) (string, error) {
+	token := r.URL.Query().Get("access_token")
+	if token != "" {
+		return token, nil
+	}
+	token = r.Header.Get("Access-Token")
+	if token != "" {
+		return token, nil
+	}
+	w.WriteHeader(401)
+	w.Write([]byte(`{"code":"INVALID_ACCESS_TOKEN","message":"无效的令牌"}`))
+	return "", errors.New("")
+}
+
+// -------------------- MySql --------------------
+var db *sql.DB
 
 func init_redis() {
 	var err error
@@ -50,6 +167,7 @@ func init_redis() {
 	}
 	defer redis_pool.Put(conn)
 	conn.Cmd("FLUSHDB")
+	log.Println("db flushed")
 
 	redis_subpub, err := redis.Dial("tcp", host+":"+port)
 	if err != nil {
@@ -73,12 +191,13 @@ func init_redis() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		if num > 3 {
+		if num > NR_PEERS {
 			log.Fatal("TOO MANY")
 		}
-		if num == 3 {
+		if num == NR_PEERS {
 			break
 		}
+		log.Println("waiting for peers...")
 	}
 
 	go func() {
@@ -88,6 +207,7 @@ func init_redis() {
 			log.Fatal(err)
 		}
 		defer redis_pool.Put(conn)
+		log.Println("redis_pubsub booted up")
 		for {
 			r := redis_sub.Receive()
 			if r.Timeout() {
@@ -98,6 +218,8 @@ func init_redis() {
 				log.Fatal(err)
 			}
 			if r.Channel == "signal" {
+				// FIXME: signal should be separated
+				log.Println("signal received")
 				signal <- 1
 			} else if r.Channel == "food" {
 				food_id, _ := strconv.Atoi(r.Message)
@@ -106,16 +228,24 @@ func init_redis() {
 				var oldv int32
 				for {
 					oldv = *old
+					if oldv == -1 {
+						break
+					}
 					if oldv == 0 {
+						*old = -1
 						break
 					}
 					if !atomic.CompareAndSwapInt32(old, oldv, 0) {
+						log.Println("cas failed, retrying...")
 						continue
 					}
 					if conn.Cmd("INCRBY", "f:"+strconv.Itoa(food_id), oldv).Err != nil {
 						log.Fatal("food INC")
 					}
+					*old = -1
+					break
 				}
+				log.Println("cas ok")
 				conn.Cmd("PUBLISH", "signal", "go")
 			}
 		}
@@ -123,30 +253,14 @@ func init_redis() {
 
 	// just try it to (useless) warm up 2333
 	conn.Cmd("PUBLISH", "signal", "go")
-	<-signal
-	<-signal
-	<-signal
+	log.Println("signal published")
+	for sig_i := 0; sig_i < NR_PEERS; sig_i++ {
+		log.Println("waiting")
+		<-signal
+		log.Println("waited")
+	}
+	log.Println("redis ok")
 }
-
-type TokenUserCart struct {
-	token   string
-	user_id string
-	cart_id string
-}
-
-type Cart struct {
-	cart_id string
-	token   string
-	count   int
-}
-
-// -------------------- Login --------------------
-type BodyLogin struct {
-	Username string
-	Password string
-}
-
-var root_uid string
 
 func login(w http.ResponseWriter, r *http.Request) {
 	// check POST
@@ -190,15 +304,6 @@ func login(w http.ResponseWriter, r *http.Request) {
 	//	user.user_id, body.Username, token)
 	w.Write([]byte(fmt.Sprintf(`{"user_id":%s,"username":"%s","access_token":"%s"}`,
 		user.user_id, body.Username, user.token)))
-}
-
-// -------------------- Cart --------------------
-type BodyCart struct {
-	Food_id int
-	Count   int
-}
-type BodyCartId struct {
-	Cart_id string
 }
 
 func carts(w http.ResponseWriter, r *http.Request) {
@@ -256,8 +361,8 @@ func post_carts_slow_path(w http.ResponseWriter, token string) {
 	}
 	var cart_id string
 	for {
-		cart_id = user_id + raw_next_rand_less()
-		r, err := conn.Cmd("SETNX", "c:"+cart_id, user_id).Int()
+		cart_id = user_id + "_" + raw_next_rand_less()
+		r, err := conn.Cmd("LPUSH", "c:"+cart_id, user_id).Int()
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -267,11 +372,13 @@ func post_carts_slow_path(w http.ResponseWriter, token string) {
 			cart2token_ext_rwmutex.Unlock()
 			break
 		}
+		log.Println("duplicated keys for cart")
 	}
 	w.Write([]byte(fmt.Sprintf(`{"cart_id":"%s"}`, cart_id)))
 }
+
 func post_carts(w http.ResponseWriter, token string) {
-	carts, ok := token2cart[token]
+	carts, ok := token2carts[token]
 	if !ok {
 		if debug {
 			log.Println("invalid token")
@@ -282,6 +389,7 @@ func post_carts(w http.ResponseWriter, token string) {
 	}
 	if carts.used {
 		post_carts_slow_path(w, token)
+		return
 	}
 
 	carts.used = true
@@ -315,6 +423,7 @@ func patch_carts(
 	var cart_token string
 	cart_token, ok = cart2token[cart_id]
 	if !ok {
+		//fmt.Println("not found cart_id: " + cart_id)
 		cart2token_ext_rwmutex.RLock()
 		cart_token, ok = cart2token_ext[cart_id]
 		cart2token_ext_rwmutex.RUnlock()
@@ -348,10 +457,12 @@ func patch_carts(
 	for i := 0; i < body.Count; i++ {
 		tot_count, err = conn.PipeResp().Int()
 		if err != nil {
+			println("c:" + cart_id)
+			fmt.Printf("food: %d\n", body.Food_id)
 			log.Fatal(err)
 		}
 	}
-	if tot_count > 3 {
+	if tot_count > 4 {
 		w.WriteHeader(403)
 		w.Write([]byte(`{"code":"FOOD_OUT_OF_LIMIT","message":"篮子中食物数量超过了三个"}`))
 		return
@@ -359,11 +470,6 @@ func patch_carts(
 
 	w.WriteHeader(204)
 	w.Write([]byte(""))
-}
-
-// -------------------- Order --------------------
-type BodyOrder struct {
-	Cart_id string
 }
 
 func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
@@ -375,6 +481,7 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 	}
 	defer redis_pool.Put(conn)
 
+	//fmt.Println("== post orders ==")
 	cart_id := body.Cart_id
 	user_id, ok := token2uid[token]
 	if !ok {
@@ -382,6 +489,7 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 		w.Write([]byte(`{"code":"INVALID_ACCESS_TOKEN","message":"无效的令牌"}`))
 		return
 	}
+	//fmt.Println("== post orders ==")
 	cart_token, ok := cart2token[cart_id]
 	if !ok {
 		cart2token_ext_rwmutex.RLock()
@@ -393,24 +501,28 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 			return
 		}
 	}
+	//fmt.Println("== post orders ==")
 	if cart_token != token {
 		w.WriteHeader(401)
 		w.Write([]byte(`{"code":"NOT_AUTHORIZED_TO_ACCESS_CART","message":"无权限访问指定的篮子" }`))
 		return
 	}
 
-	cart, err := conn.Cmd("GET", "c:"+cart_id).List()
+	cart, err := conn.Cmd("LRANGE", "c:"+cart_id, 0, -1).List()
 	if err != nil {
 		log.Fatal(err)
 	}
+	//fmt.Printf("%+v\n", cart)
+	//defer fmt.Println("done")
 
 	// ==================== commit ====================
 	order := fmt.Sprintf(`{"id":"%s","user_id":%s,"items":[`, token, user_id)
 	total := 0
 	null := true
 	//conn.PipeAppend("MULTI")
-	//fmt.Printf("%+v\n", cart)
 	ll := len(cart)
+	cart = cart[0 : ll-1]
+	ll--
 	food_ids := make([]int, ll)
 	counts := make([]int32, ll)
 	local_done := make([]bool, ll)
@@ -428,6 +540,8 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 			}
 		}
 	}
+	//fmt.Printf("%+v\n", cart)
+	//fmt.Printf("%+v\n", counts)
 
 	for i, food_id := range food_ids {
 		if counts[i] == 0 {
@@ -451,6 +565,11 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 		var oldv int32 = *old
 		for {
 			oldv = *old
+			if oldv == 0 {
+				log.Println("seem odd: oldv == 0")
+				need_slow_path = true
+				break
+			}
 			if oldv == -1 {
 				need_slow_path = true
 				break
@@ -458,16 +577,23 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 			if oldv < counts[i] {
 				need_slow_path = true
 				conn.Cmd("PUBLISH", "food", food_id)
-				<-signal
-				<-signal
-				<-signal
+				for sig_i := 0; sig_i < NR_PEERS; sig_i++ {
+					<-signal
+				}
+				break
 			}
 			// local storage is sufficient
 			if !atomic.CompareAndSwapInt32(old, oldv, oldv-counts[i]) {
+				log.Println("cas failed when local acquiring, retrying...")
 				continue
+			}
+			if oldv == counts[i] {
+				conn.Cmd("PUBLISH", "food", food_id)
+				*old = -1
 			}
 			// local storage is acquired successfully
 			local_done[i] = true
+			break
 		}
 	}
 	if !need_slow_path {
@@ -486,6 +612,7 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 		return
 	}
 
+	println("trap into slow path")
 	// slow_path
 	for i, food_str := range cart {
 		if counts[i] == 0 {
@@ -529,7 +656,7 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 				if counts[i] == 0 {
 					continue
 				}
-				conn.PipeAppend("INCBY", "f:"+food_str, counts[i])
+				conn.PipeAppend("INCRBY", "f:"+food_str, counts[i])
 			}
 			if del {
 				conn.PipeAppend("DEL", "o:"+token)
@@ -647,32 +774,6 @@ func admin_orders(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(ret))
 }
 
-var token2uid map[string]string
-
-type Carts struct {
-	// [0] is mine
-	cart_ids [3]string
-	used     bool
-}
-
-var token2cart map[string]*Carts
-var cart2token map[string]string
-
-var cart2token_ext_rwmutex sync.RWMutex
-var cart2token_ext map[string]string
-
-// -------------------- Food --------------------
-type Food struct {
-	//	food_id int
-	price int
-	stock int
-}
-
-var done_orders map[string]string
-var foods_cache map[int]Food
-var local_foods map[int]*int32
-var sorted_foods_keys []int
-
 // TODO: weaken the consistency
 func foods(w http.ResponseWriter, r *http.Request) {
 	// check GET
@@ -696,75 +797,10 @@ func foods(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(ret))
 }
 
-// TODO: make things async
-//  e.g. use goroutine to calc `total`
-type User struct {
-	user_id  int
-	username string
-	// access_token string // hidden to map key
-	done  bool
-	total int
-	//order Cart // get async
-}
-
-type UserP struct {
-	user_id  string
-	password string
-	token    string
-}
-
-const TOKEN_COUNT = 301001
-const TOKEN_LEN = 24
-
-var tokens [TOKEN_COUNT]string
-var userps map[string]*UserP
-var token2order map[string]string
-
-const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-func RandStringBytes(n int) string {
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = letters[rand.Intn(len(letters))]
-	}
-	return string(b)
-}
-
-var randp int64
-
-func gen_token() {
-	for i := 0; i < TOKEN_COUNT; i++ {
-		tokens[i] = RandStringBytes(TOKEN_LEN)
-	}
-	randp = 0
-}
-func raw_next_rand_less() string {
-	if TOKEN_LEN < 0 {
-		return RandStringBytes(TOKEN_LEN)
-	}
-	return RandStringBytes(TOKEN_LEN - 4)
-}
-
-func raw_next_rand() string {
-	return RandStringBytes(TOKEN_LEN)
-}
-func nextRand() string {
-	got := atomic.AddInt64(&randp, 1)
-	if got >= TOKEN_COUNT {
-		return RandStringBytes(TOKEN_LEN)
-	}
-	return tokens[got]
-}
-
-// -------------------- MySql --------------------
-var db *sql.DB
-
 func cache_foods() {
 	var id int
 	var price int
 	var stock int
-	foods_cache = map[int]Food{}
-	local_foods = map[int]*int32{}
 	rows, err := db.Query("SELECT id, stock, price FROM food")
 	if err != nil {
 		log.Println("cache_foods")
@@ -778,7 +814,7 @@ func cache_foods() {
 			log.Println("cache_foods")
 			log.Fatal(err)
 		}
-		foods_cache[id] = Food{stock, price}
+		foods_cache[id] = &Food{stock, price}
 	}
 	err = rows.Err()
 	if err != nil {
@@ -802,23 +838,25 @@ func cache_foods() {
 		conn.Cmd("SETNX", "f:"+strconv.Itoa(k), v.stock)
 	}
 	for k, v := range foods_cache {
-		var p int32 = int32(v.stock) / 3
+		var p int32 = int32(v.stock) / NR_PEERS
 		local_foods[k] = &p
-		conn.Cmd("DECRBY", "f:"+strconv.Itoa(k), local_foods[k])
+		r := conn.Cmd("DECRBY", "f:"+strconv.Itoa(k), *local_foods[k])
+		if r.Err != nil {
+			log.Fatal(r)
+		}
 	}
 	log.Println("food cached")
 
 	conn.Cmd("PUBLISH", "signal", "go")
-	<-signal
-	<-signal
-	<-signal
+	for sig_i := 0; sig_i < NR_PEERS; sig_i++ {
+		<-signal
+	}
 	log.Println("all food cached")
 }
 func cache_users() {
 	var id int
 	var name string
 	var pass string
-	userps = map[string]*UserP{}
 
 	rows, err := db.Query("SELECT id, name, password FROM user")
 	if err != nil {
@@ -867,56 +905,60 @@ func cache_users() {
 		}
 		userps[k].token = token
 		token2uid[token] = v.user_id
-		token2cart[token] = &Carts{[3]string{"", "", ""}, false}
+		token2carts[token] = &Carts{[3]string{"", "", ""}, false}
 		for {
-			cart_id := v.user_id + raw_next_rand_less()
-			r, err := conn.Cmd("SETNX", "c:"+cart_id, v.user_id).Int()
+			cart_id := v.user_id + "_" + raw_next_rand_less()
+			r, err := conn.Cmd("LPUSH", "c:"+cart_id, v.user_id).Int()
 			if err != nil {
 				log.Fatal(err)
 			}
-			if r == 1 {
-				// set mine
-				token2cart[token].cart_ids[0] = cart_id
-				break
+			if r != 1 {
+				log.Println("duplicated cart keys")
+				continue
 			}
+			// set mine
+			token2carts[token].cart_ids[0] = cart_id
+			break
 		}
 	}
 	log.Println("cart warmed")
 	conn.Cmd("PUBLISH", "signal", "go")
-	<-signal
-	<-signal
-	<-signal
+	for sig_i := 0; sig_i < NR_PEERS; sig_i++ {
+		<-signal
+	}
 	log.Println("all cart warmed")
 	for _, v := range userps {
 		var carts []string
 		var err error
 		token := v.token
-		carts, err = conn.Cmd("KEYS", "c:"+v.user_id).List()
+		carts, err = conn.Cmd("KEYS", "c:"+v.user_id+"_*").List()
 		if err != nil {
 			log.Fatal(err)
 		}
-		if len(carts) < 3 {
+		if len(carts) < NR_PEERS {
+			log.Printf("%s %+v\n", v.user_id, carts)
 			log.Fatal("too small")
 			break
 		}
-		for _, carts := range carts {
-			cart2token[carts] = token
-			for i, _ := range token2cart[token].cart_ids {
-				if token2cart[token].cart_ids[i] == carts {
+		for _, cart := range carts {
+			cart2token[cart[2:]] = token
+			//conn.Cmd("SET", "debug:cart2token="+cart[2:], token)
+			for i, _ := range token2carts[token].cart_ids {
+				if token2carts[token].cart_ids[i] == cart {
 					break
 				}
-				if token2cart[token].cart_ids[i] != "" {
+				if token2carts[token].cart_ids[i] != "" {
 					continue
 				}
-				token2cart[token].cart_ids[i] = carts
+				token2carts[token].cart_ids[i] = cart
 			}
 		}
 	}
 	log.Println("cart warmed")
 	conn.Cmd("PUBLISH", "signal", "go")
-	<-signal
-	<-signal
-	<-signal
+	for sig_i := 0; sig_i < NR_PEERS; sig_i++ {
+		<-signal
+	}
 	log.Println("all cart warmed")
 }
 
@@ -943,6 +985,7 @@ func init_mysql() {
 // -------------------- main --------------------
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	host := os.Getenv("APP_HOST")
 	port := os.Getenv("APP_PORT")
 	if host == "" {
@@ -981,69 +1024,3 @@ func main() {
 	log.Println("serving...")
 	http.ListenAndServe(addr, nil)
 }
-
-func get_token(w http.ResponseWriter, r *http.Request) (string, error) {
-	token := r.URL.Query().Get("access_token")
-	if token != "" {
-		return token, nil
-	}
-	token = r.Header.Get("Access-Token")
-	if token != "" {
-		return token, nil
-	}
-	w.WriteHeader(401)
-	w.Write([]byte(`{"code":"INVALID_ACCESS_TOKEN","message":"无效的令牌"}`))
-	return "", errors.New("")
-}
-
-/*
-save in memory:
-
-map [foodid] Food
-Food {
-	price int
-	count int
-}
-
-map [username] password
-map [token] User
-map [token] cartid
-
-User {
-	user_id int
-	username string
-	access_token string
-	done bool
-	total int
-	order DoneOrder { // calc async
-	} => string
-}
-
-type Item {
-	food_id int
-	count int
-}
-
-type Cart struct {
-	cart_id string
-	items [3]Item
-	access_token string
-}
-
-
-// TODO: make things async
-//  e.g. use goroutine to calc `total`
-type User struct {
-	user_id int
-	username string
-	// access_token string // hidden to map key
-	done bool
-	total int
-	order Cart // get async
-}
-
-save in redis:
-access_token => orders (string)
-food_id => count (int)
-
-*/
