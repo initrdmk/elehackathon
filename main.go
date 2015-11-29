@@ -40,7 +40,7 @@ var redis_subpub *redis.Client
 var redis_sub *pubsub.SubClient
 
 // FIXME: need to separate
-var signal chan int = make(chan int, 1)
+var signal chan int = make(chan int, 3)
 
 // -------------------- Login --------------------
 type BodyLogin struct {
@@ -905,11 +905,6 @@ func cache_users() {
 		}
 	}
 	log.Println("user warmed")
-	conn.Cmd("PUBLISH", "signal", "go")
-	for sig_i := 0; sig_i < NR_PEERS; sig_i++ {
-		<-signal
-	}
-	log.Println("all cart warmed")
 	for k, v := range userps {
 		token, err := conn.Cmd("GET", "u:"+v.user_id).Str()
 		if err != nil {
@@ -937,6 +932,11 @@ func cache_users() {
 		}
 	}
 	log.Println("cart warmed")
+	conn.Cmd("PUBLISH", "signal", "go")
+	for sig_i := 0; sig_i < NR_PEERS; sig_i++ {
+		<-signal
+	}
+	log.Println("all cart warmed")
 	for _, v := range userps {
 		var carts []string
 		var err error
