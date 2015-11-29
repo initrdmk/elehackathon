@@ -25,7 +25,7 @@ import "database/sql"
 import _ "github.com/go-sql-driver/mysql"
 
 const debug = false
-const NR_PEERS = 1
+const NR_PEERS = 3
 
 // -------------------- Global --------------------
 // -------------------- Redis --------------------
@@ -34,7 +34,7 @@ var redis_subpub *redis.Client
 var redis_sub *pubsub.SubClient
 
 // FIXME: need to separate
-var signal chan int = make(chan int, 1)
+var signal chan int = make(chan int, NR_PEERS)
 
 // -------------------- Login --------------------
 type BodyLogin struct {
@@ -81,6 +81,7 @@ type Food struct {
 
 //var done_orders map[string]string
 var foods_cache map[int]*Food = make(map[int]*Food)
+var foods_signal map[int]chan int = make(map[int]chan int)
 var local_foods map[int]*int32 = make(map[int]*int32)
 var sorted_foods_keys []int
 
@@ -166,7 +167,7 @@ func init_redis() {
 		log.Fatal(err)
 	}
 	defer redis_pool.Put(conn)
-	conn.Cmd("FLUSHDB")
+	//conn.Cmd("FLUSHDB")
 	log.Println("db flushed")
 
 	redis_subpub, err := redis.Dial("tcp", host+":"+port)
@@ -176,6 +177,10 @@ func init_redis() {
 	}
 	redis_sub = pubsub.NewSubClient(redis_subpub)
 	if redis_sub.Subscribe("food").Err != nil {
+		log.Println("init_redis")
+		log.Fatal(err)
+	}
+	if redis_sub.Subscribe("food_signal").Err != nil {
 		log.Println("init_redis")
 		log.Fatal(err)
 	}
@@ -197,7 +202,8 @@ func init_redis() {
 		if num == NR_PEERS {
 			break
 		}
-		log.Println("waiting for peers...")
+		//log.Println("waiting for peers...")
+		runtime.Gosched()
 	}
 
 	go func() {
@@ -219,7 +225,7 @@ func init_redis() {
 			}
 			if r.Channel == "signal" {
 				// FIXME: signal should be separated
-				log.Println("signal received")
+				//log.Println("signal received")
 				signal <- 1
 			} else if r.Channel == "food" {
 				food_id, _ := strconv.Atoi(r.Message)
@@ -236,7 +242,7 @@ func init_redis() {
 						break
 					}
 					if !atomic.CompareAndSwapInt32(old, oldv, 0) {
-						log.Println("cas failed, retrying...")
+						//log.Println("cas failed, retrying...")
 						continue
 					}
 					if conn.Cmd("INCRBY", "f:"+strconv.Itoa(food_id), oldv).Err != nil {
@@ -245,8 +251,12 @@ func init_redis() {
 					*old = -1
 					break
 				}
-				log.Println("cas ok")
-				conn.Cmd("PUBLISH", "signal", "go")
+				//log.Println("cas ok")
+				conn.Cmd("PUBLISH", "food_signal", r.Message)
+			} else if r.Channel == "food_signal" {
+				//log.Println("food signal received")
+				food_id, _ := strconv.Atoi(r.Message)
+				foods_signal[food_id] <- 1
 			}
 		}
 	}()
@@ -566,7 +576,7 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 		for {
 			oldv = *old
 			if oldv == 0 {
-				log.Println("seem odd: oldv == 0")
+				//log.Println("seem odd: oldv == 0")
 				need_slow_path = true
 				break
 			}
@@ -578,13 +588,13 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 				need_slow_path = true
 				conn.Cmd("PUBLISH", "food", food_id)
 				for sig_i := 0; sig_i < NR_PEERS; sig_i++ {
-					<-signal
+					<-foods_signal[food_id]
 				}
 				break
 			}
 			// local storage is sufficient
 			if !atomic.CompareAndSwapInt32(old, oldv, oldv-counts[i]) {
-				log.Println("cas failed when local acquiring, retrying...")
+				//log.Println("cas failed when local acquiring, retrying...")
 				continue
 			}
 			if oldv == counts[i] {
@@ -612,7 +622,7 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 		return
 	}
 
-	println("trap into slow path")
+	//println("trap into slow path")
 	// slow_path
 	for i, food_str := range cart {
 		if counts[i] == 0 {
@@ -825,6 +835,7 @@ func cache_foods() {
 	sorted_foods_keys = make([]int, 0)
 	for k, _ := range foods_cache {
 		sorted_foods_keys = append(sorted_foods_keys, k)
+		foods_signal[k] = make(chan int, NR_PEERS)
 	}
 	sort.Ints(sorted_foods_keys)
 
