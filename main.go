@@ -12,7 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
+	//"sync"
 	"sync/atomic"
 	"time"
 	//	"github.com/julienschmidt/httprouter"
@@ -74,9 +74,6 @@ type Carts struct {
 
 var token2carts map[string]*Carts = make(map[string]*Carts)
 var cart2token map[string]string = make(map[string]string)
-
-var cart2token_ext_rwmutex sync.RWMutex
-var cart2token_ext map[string]string = make(map[string]string)
 
 // -------------------- Food --------------------
 type Food struct {
@@ -375,9 +372,6 @@ func post_carts_slow_path(w http.ResponseWriter, token string) {
 			log.Fatal(err)
 		}
 		if r == 1 {
-			cart2token_ext_rwmutex.Lock()
-			cart2token_ext[cart_id] = token
-			cart2token_ext_rwmutex.Unlock()
 			break
 		}
 		log.Println("duplicated keys for cart")
@@ -421,7 +415,7 @@ func patch_carts(
 		log.Println("patch_cart")
 		log.Fatal(err)
 	}
-	_, ok := token2uid[token]
+	user_id, ok := token2uid[token]
 	if !ok {
 		w.WriteHeader(401)
 		w.Write([]byte(`{"code":"INVALID_ACCESS_TOKEN","message":"无效的令牌"}`))
@@ -432,20 +426,23 @@ func patch_carts(
 	cart_token, ok = cart2token[cart_id]
 	if !ok {
 		//fmt.Println("not found cart_id: " + cart_id)
-		cart2token_ext_rwmutex.RLock()
-		cart_token, ok = cart2token_ext[cart_id]
-		cart2token_ext_rwmutex.RUnlock()
-		if !ok {
+		cart_user_id, err := conn.Cmd("LINDEX", "c:"+cart_id, -1).Str()
+		if err != nil || cart_user_id == "" {
 			w.WriteHeader(404)
 			w.Write([]byte(`{"code":"CART_NOT_FOUND","message":"篮子不存在"}`))
 			return
 		}
-	}
-
-	if cart_token != token {
-		w.WriteHeader(401)
-		w.Write([]byte(`{"code":"NOT_AUTHORIZED_TO_ACCESS_CART","message":"无权限访问指定的篮子" }`))
-		return
+		if cart_user_id != user_id {
+			w.WriteHeader(401)
+			w.Write([]byte(`{"code":"NOT_AUTHORIZED_TO_ACCESS_CART","message":"无权限访问指定的篮子" }`))
+			return
+		}
+	} else {
+		if cart_token != token {
+			w.WriteHeader(401)
+			w.Write([]byte(`{"code":"NOT_AUTHORIZED_TO_ACCESS_CART","message":"无权限访问指定的篮子" }`))
+			return
+		}
 	}
 
 	_, ok = foods_cache[body.Food_id]
@@ -499,22 +496,26 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 		return
 	}
 	//fmt.Println("== post orders ==")
+
 	cart_token, ok := cart2token[cart_id]
 	if !ok {
-		cart2token_ext_rwmutex.RLock()
-		cart_token, ok = cart2token_ext[cart_id]
-		cart2token_ext_rwmutex.RUnlock()
-		if !ok {
+		cart_user_id, err := conn.Cmd("LINDEX", "c:"+cart_id, -1).Str()
+		if err != nil || cart_user_id == "" {
 			w.WriteHeader(404)
 			w.Write([]byte(`{"code":"CART_NOT_FOUND","message":"篮子不存在"}`))
 			return
 		}
-	}
-	//fmt.Println("== post orders ==")
-	if cart_token != token {
-		w.WriteHeader(401)
-		w.Write([]byte(`{"code":"NOT_AUTHORIZED_TO_ACCESS_CART","message":"无权限访问指定的篮子" }`))
-		return
+		if cart_user_id != user_id {
+			w.WriteHeader(401)
+			w.Write([]byte(`{"code":"NOT_AUTHORIZED_TO_ACCESS_CART","message":"无权限访问指定的篮子" }`))
+			return
+		}
+	} else {
+		if cart_token != token {
+			w.WriteHeader(401)
+			w.Write([]byte(`{"code":"NOT_AUTHORIZED_TO_ACCESS_CART","message":"无权限访问指定的篮子" }`))
+			return
+		}
 	}
 
 	cart, err := conn.Cmd("LRANGE", "c:"+cart_id, 0, -1).List()
