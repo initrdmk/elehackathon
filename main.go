@@ -68,9 +68,8 @@ type BodyOrder struct {
 var token2uid map[string]string = make(map[string]string)
 
 type Carts struct {
-	// [0] is mine
-	cart_ids [3]string
-	used     bool
+	cart_id string
+	used    bool
 }
 
 var token2carts map[string]*Carts = make(map[string]*Carts)
@@ -91,6 +90,7 @@ var foods_cache map[int]*Food = make(map[int]*Food)
 var foods_signal map[int]chan int = make(map[int]chan int)
 var local_foods map[int]*int32 = make(map[int]*int32)
 var sorted_foods_keys []int
+var sorted_users_keys []string
 
 type UserP struct {
 	user_id  string
@@ -386,7 +386,7 @@ func post_carts_slow_path(w http.ResponseWriter, token string) {
 }
 
 func post_carts(w http.ResponseWriter, token string) {
-	carts, ok := token2carts[token]
+	cart, ok := token2carts[token]
 	if !ok {
 		if debug {
 			log.Println("invalid token")
@@ -395,13 +395,13 @@ func post_carts(w http.ResponseWriter, token string) {
 		w.Write([]byte(`{"code":"INVALID_ACCESS_TOKEN","message":"无效的令牌"}`))
 		return
 	}
-	if carts.used {
+	if cart.used {
 		post_carts_slow_path(w, token)
 		return
 	}
 
-	carts.used = true
-	w.Write([]byte(fmt.Sprintf(`{"cart_id":"%s"}`, carts.cart_ids[0])))
+	cart.used = true
+	w.Write([]byte(fmt.Sprintf(`{"cart_id":"%s"}`, cart.cart_id)))
 }
 
 func patch_carts(
@@ -848,15 +848,16 @@ func cache_foods() {
 	}
 	defer redis_pool.Put(conn)
 	for k, v := range foods_cache {
-		conn.Cmd("SETNX", "f:"+strconv.Itoa(k)+":", v.stock)
+		conn.PipeAppend("SETNX", "f:"+strconv.Itoa(k)+":", v.stock)
 	}
 	for k, v := range foods_cache {
 		var p int32 = int32(v.stock) / int32(NR_PEERS)
 		local_foods[k] = &p
-		r := conn.Cmd("DECRBY", "f:"+strconv.Itoa(k)+":", *local_foods[k])
-		if r.Err != nil {
-			log.Fatal(r)
-		}
+		conn.PipeAppend("DECRBY", "f:"+strconv.Itoa(k)+":", *local_foods[k])
+	}
+	for _ = range foods_cache {
+		conn.PipeResp()
+		conn.PipeResp()
 	}
 	log.Println("food cached")
 	conn.Cmd("PUBLISH", "signal", "go")
@@ -895,6 +896,12 @@ func cache_users() {
 	}
 	log.Println("user cached")
 
+	sorted_users_keys = make([]string, 0)
+	for k, _ := range userps {
+		sorted_users_keys = append(sorted_users_keys, k)
+	}
+	//sort.String(sorted_users_keys)
+
 	conn, err := redis_pool.Get()
 	if err != nil {
 		log.Println("cache_users")
@@ -903,22 +910,27 @@ func cache_users() {
 	defer redis_pool.Put(conn)
 	for _, v := range userps {
 		token := "t=" + raw_next_rand()
-		if conn.Cmd("SETNX", "u:"+v.user_id, token).Err != nil {
-			log.Fatal(err)
-		}
+		conn.PipeAppend("SETNX", "u:"+v.user_id, token)
+	}
+	for _ = range userps {
+		conn.PipeResp()
 	}
 	log.Println("user warmed")
-	for k, v := range userps {
-		token, err := conn.Cmd("GET", "u:"+v.user_id).Str()
+	for _, k := range sorted_users_keys {
+		conn.PipeAppend("GET", "u:"+userps[k].user_id)
+	}
+	for _, k := range sorted_users_keys {
+		v := userps[k]
+		token, err := conn.PipeResp().Str()
 		if err != nil {
-			log.Fatal(err)
-		}
-		if conn.Cmd("SETNX", "t:"+token, v.user_id).Err != nil {
 			log.Fatal(err)
 		}
 		userps[k].token = token
 		token2uid[token] = v.user_id
-		token2carts[token] = &Carts{[3]string{"", "", ""}, false}
+		token2carts[token] = &Carts{"", false}
+	}
+	for _, k := range sorted_users_keys {
+		v := userps[k]
 		for {
 			cart_id := v.user_id + "_" + raw_next_rand_less()
 			r, err := conn.Cmd("LPUSH", "c:"+cart_id, v.user_id).Int()
@@ -930,9 +942,15 @@ func cache_users() {
 				continue
 			}
 			// set mine
-			token2carts[token].cart_ids[0] = cart_id
+			token2carts[v.token].cart_id = cart_id
 			break
 		}
+	}
+	for _, v := range userps {
+		conn.PipeAppend("SETNX", "t:"+v.token, v.user_id)
+	}
+	for _ = range userps {
+		conn.PipeResp()
 	}
 	log.Println("cart warmed")
 	conn.Cmd("PUBLISH", "signal", "go")
@@ -940,11 +958,16 @@ func cache_users() {
 		<-signal
 	}
 	log.Println("all cart warmed")
-	for _, v := range userps {
+	for _, k := range sorted_users_keys {
+		v := userps[k]
+		conn.PipeAppend("KEYS", "c:"+v.user_id+"_*")
+	}
+	for _, k := range sorted_users_keys {
 		var carts []string
 		var err error
+		v := userps[k]
 		token := v.token
-		carts, err = conn.Cmd("KEYS", "c:"+v.user_id+"_*").List()
+		carts, err = conn.PipeResp().List()
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -958,15 +981,17 @@ func cache_users() {
 		for _, cart := range carts {
 			cart2token[cart[2:]] = token
 			//conn.Cmd("SET", "debug:cart2token="+cart[2:], token)
-			for i, _ := range token2carts[token].cart_ids {
-				if token2carts[token].cart_ids[i] == cart {
-					break
+			/*
+				for i, _ := range token2carts[token].cart_ids {
+					if token2carts[token].cart_ids[i] == cart {
+						break
+					}
+					if token2carts[token].cart_ids[i] != "" {
+						continue
+					}
+					token2carts[token].cart_ids[i] = cart
 				}
-				if token2carts[token].cart_ids[i] != "" {
-					continue
-				}
-				token2carts[token].cart_ids[i] = cart
-			}
+			*/
 		}
 	}
 	log.Println("cart warmed")
@@ -1038,7 +1063,7 @@ func main() {
 	http.HandleFunc("/orders", orders)
 	http.HandleFunc("/admin/orders", admin_orders)
 
-	ticker = time.NewTicker(time.Second * 60)
+	ticker = time.NewTicker(time.Second * 300)
 	go func() {
 		conn, err := redis_pool.Get()
 		if err != nil {
