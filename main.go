@@ -40,7 +40,7 @@ var redis_subpub *redis.Client
 var redis_sub *pubsub.SubClient
 
 // FIXME: need to separate
-var signal chan int = make(chan int, NR_PEERS)
+var signal chan int = make(chan int, 1)
 
 // -------------------- Login --------------------
 type BodyLogin struct {
@@ -198,26 +198,14 @@ func init_redis() {
 		log.Fatal("add signal")
 	}
 
-	nticker = time.NewTicker(time.Millisecond * 200)
-	go func() {
-		conn, err := redis_pool.Get()
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer redis_pool.Put(conn)
-		for _ = range nticker.C {
-			num, err := conn.Cmd("GET", "SIGNAL").Int()
-			if err != nil {
-				log.Fatal(err)
-			}
-			if num > NR_PEERS {
-				NR_PEERS = num
-			}
-			if NR_PEERS == 3 {
-				return
-			}
-		}
-	}()
+	timer := time.NewTimer(time.Second * 10)
+	<-timer.C
+	num, err := conn.Cmd("GET", "SIGNAL").Int()
+	if err != nil {
+		log.Fatal(err)
+	}
+	NR_PEERS = num
+	fmt.Printf("%d\n", NR_PEERS)
 
 	go func() {
 		conn, err := redis_pool.Get()
@@ -595,6 +583,8 @@ func post_orders(w http.ResponseWriter, token string, body BodyOrder) {
 				for sig_i := 0; sig_i < NR_PEERS; sig_i++ {
 					<-foods_signal[food_id]
 				}
+				timer := time.NewTimer(time.Second * 1)
+				<-timer.C
 				break
 			}
 			// local storage is sufficient
