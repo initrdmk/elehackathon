@@ -199,7 +199,7 @@ func init_redis() {
 		log.Fatal("add signal")
 	}
 
-	timer := time.NewTimer(time.Second * 10)
+	timer := time.NewTimer(time.Second * 5)
 	<-timer.C
 	num, err := conn.Cmd("GET", "SIGNAL").Int()
 	if err != nil {
