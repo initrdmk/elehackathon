@@ -1035,7 +1035,7 @@ func main() {
 	http.HandleFunc("/orders", orders)
 	http.HandleFunc("/admin/orders", admin_orders)
 
-	ticker = time.NewTicker(time.Second * 30)
+	ticker = time.NewTicker(time.Second * 60)
 	go func() {
 		conn, err := redis_pool.Get()
 		if err != nil {
