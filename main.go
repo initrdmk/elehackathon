@@ -932,21 +932,15 @@ func cache_users() {
 	}
 	for _, k := range sorted_users_keys {
 		v := userps[k]
-		for {
-			cart_id := v.user_id + "_" + raw_next_rand_less()
-			r, err := conn.Cmd("LPUSH", "c:"+cart_id, v.user_id).Int()
-			if err != nil {
-				log.Fatal(err)
-			}
-			if r != 1 {
-				log.Println("duplicated cart keys")
-				continue
-			}
-			// set mine
-			token2carts[v.token].cart_id = cart_id
-			conn.Cmd("LPUSH", "u2c:"+v.user_id, cart_id)
-			break
-		}
+		cart_id := v.user_id + "_" + raw_next_rand_less()
+		conn.PipeAppend("LPUSH", "c:"+cart_id, v.user_id)
+		// set mine
+		token2carts[v.token].cart_id = cart_id
+		conn.PipeAppend("LPUSH", "u2c:"+v.user_id, cart_id)
+	}
+	for _ = range sorted_users_keys {
+		conn.PipeResp()
+		conn.PipeResp()
 	}
 	for _, v := range userps {
 		conn.PipeAppend("SETNX", "t:"+v.token, v.user_id)
