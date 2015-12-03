@@ -1,179 +1,217 @@
-# Eleme Hackathon Intro
+# Go Code for Eleme Hackathon
 
-饿了么 Hackathon 2015 初赛信息介绍。
+废话懒得说，直接上干货吧。
 
-活动及报名官网: http://hackathon.ele.me
+## Summary
 
-本简介官方仓库: https://hackhub.ele.me/eleme/hackathon-intro
+总的设计原则是: common case fast, rare case correct。尽量在本地缓存，
+对频繁出现的情况（benchmark中的请求）要尽可能的快，对corner case要保证不出错（test中的请求）。
 
-
-## 初赛赛题
-
-使用 Python, Java, Go 三种语言（任选其一）实现一个“限时抢购”功能。
-
-功能要求:
-
-* 数据库中预设了 `food` 和 `user` 表。需要实现功能，让 `user` 表中的用户，购买 `food` 表中的食物。
-
-* 每个用户只能下一次单。每张订单食物的总数不超过 3。用户可以有多个独立的购物车。
-
-* 对实现方式，数据存储不作限制。但是需要保证最终一致性，通过下单接口返回成功的所有订单，必须和通过后台接口查询出来的订单一致。
-
-* 应用必须可以被同等部署于 3 台服务器上，共同对外提供服务。
-
-* 严格按照 `spec.md` 中的 API 规范编码，并通过所有单测。
+由于好多人说网络IO是大头，所以对这边做了最多的优化，最后结果如下：
 
 
-## 开发流程
-
-* 克隆本代码库，修改 `Vagrantfile` 并下载开发环境镜像。
-
-* 参考 `spec.md` 文件中的 API 规范，编写基于 HTTP/Json 的 RESTful API。
-
-* 编写 `app.yml` 并提供应用所需的语言环境和启动方式。
-
-* 通过 `tests/` 中的所有单元测试。
-
-* 通过 `benchmark/` 中的性能测试，并优化性能。
+| method         | 一般情况下（最优情况）的网络请求数 |        最差情况的网络请求数        |
+|----------------|:----------------------------------:|:----------------------------------:|
+| /login         |                  0                 |                  0                 |
+| /cart          |                  0                 |                  1                 |
+| /cart/:cart_id |                  1                 |           1+(#food) sync           |
+| /order         |          1 sync + 1 async          | (2+2*#food) sync + (1+#food) async |
+| /food          |                  0                 |                  0                 |
 
 
-## 快速开始
-
-为方便参赛选手快速开始编码，本次比赛预先提供了基于 vagrant + virtualbox 的各语言的开发环境镜像。
-
-### 软件依赖
-
-* Vagrant: [Vagrant Download](http://www.vagrantup.com/downloads)
-
-* Virtualbox: [Virtualbox Download](https://www.virtualbox.org/wiki/Downloads)
-
-### 基础代码库
-
-克隆本仓库后，修改 `Vagrantfile`，取消对应语言的 box 注释，保存后执行 `vagrant up`，即可获得开发所需的一切环境。
-
-各语言代码库示例:
-
-* `python`: https://hackhub.ele.me/eleme/hackathon-py
-
-* `java`: https://hackhub.ele.me/eleme/hackathon-java
-
-* `go`: https://hackhub.ele.me/eleme/hackathon-go
-
-开发环境内建 livereload 功能，当代码文件发生改变时，会自动重启应用。
+- \#food 在/cart/:cart_id中是这次请求要添加的food的数量
+- \#food 在/order中是想要提交的篮子中的food的数量
 
 
-## 环境介绍
+## All Tricks
 
-基础环境基于 Ubuntu 14.04 LTS。
+这里讲了一些用到的主要的trick，这些都是为了最大化性能。*但是*并不会影响程序的正确性，
+也就是说在product environment中也可以采用类似策略的。这不仅仅只能用于比赛。
 
-预装了 `mysql-server`, `redis-server`，并进行了端口映射，可直接通过 localhost 访问虚拟机里的 mysql, redis 和 app。详细可参考基础代码库中的 `Vagrantfile`。
-
-执行 `vagrant ssh` 可登录虚拟机命令行，代码根目录已被挂载到虚拟机中的 `/vagrant` 路径下。
-
-程序运行和重启日志会储存于代码根目录下的 `app.log`，可以使用 `tail -f app.log` 查看输出。
-
-**注意事项**
-
-环境中提供了以下环境变量: 
+- 所有的user token都预先生成好，然后用SETNX放到redis上去，之后再从redis上拉下来。
+这样不管有多少台机器，他们得到的token都是一致的。这部分是预处理的时候做的。
 
 ```
-APP_HOST=0.0.0.0
-APP_PORT=8080
-
-DB_HOST=localhost
-DB_PORT=3306
-DB_NAME=eleme
-DB_USER=root
-DB_PASS=toor
-
-REDIS_HOST=localhost
-REDIS_PORT=6379
-
-PYTHONPATH=/vagrant
-GOPATH=/srv/gopath
-JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+      // pre-process
+      for uid in users {
+         usertoken = generate_user_token();
+         redis.setnx(uid, usertoken)
+      }
+      for uid in users {
+         usertoken = redis.get(uid)
+         local_user[usertoken] = uid
+         local_token[uid] = token
+      }
+      // when /login
+      if is_password_ok() {
+         token = local_token[uid]
+         reply_token_to_user()
+      }
 ```
 
-请注意以下事项:
-
-* 代码中对应的设置不要写死对应的值，而是根据环境变量获取。
-
-* 不要更改对应的 PATH 信息。
-
-
-### 工具脚本
-
-虚拟机中提供了以下脚本:
-
-* `gendata` (`/usr/local/bin/gendata`)
-
-  此脚本用于初始化 mysql 表中预设的 `food` 表和 `user` 表。每次运行均会重新生成所有数据。
-  表中的数据均为随机生成，实际进行单元测试和性能测试前，均会运行此脚本初始化数据。
-
-* `launcher` (`/usr/local/bin/launcher`)
-
-  此脚本可根据代码根目录下的 `app.yml` 文件启动应用。
-
-* `hackathon-appreload` (`/usr/local/bin/launcher`)
-
-  此脚本可监测代码文件的改动，并在有文件修改时，重新启动应用。
-  应用启动日志，和应用输出均会被导出到代码根目录下的 `app.log` 文件。
-
-
-虚拟机中提供了以下服务 (基于 upstart):
-
-* `hackathon-app`
-
-  此服务使用 `launcher` 运行应用。
-  可执行 `sudo stop hackathon-app` 和  `sudo start hackathon-app` 来停止和开启应用。
-
-* `hackathon-appreload`
-
-  此服务提供 livereload app 功能。 当代码文件发生改动时，会尝试重启 `hackathon-app` 服务。
-
-
-### 配置规范
-
-应用通过在根目录下配置 `app.yml` 文件启动。配置文件包含两栏，`language` 和 `script`。
-
-* `language` 必须是 py2, py3, pypy, go, java 中的一种。
-
-* `script` 可以有多条命令，会依次执行。注意如果有一行 block 住了，会影响后续命令的执行。最后一行可以启动应用 server 并 block 住。
-
-
-## 测试
-
-测试分为两个部分，功能测试和性能测试。
-
-### 功能测试
-
-测试脚本基于 python 的 `pytest` 编写，可在基础代码库中运行 `make test` 来进行测试。
-
-或者手动测试，示例:
+   需要验证token的时候
 
 ```
-cd tests
-
-# run all tests
-py.test
-
-# run cart tests
-py.test test_carts.py
+      // when validing the tokens
+      uid = local_user[token]
+      if uid == nil {
+         invalid_token()
+         return
+      }
 ```
 
-代码提交至 gitlab 后，可通过 CI 来查看单测结果。 访问 http://hackhub-ci.ele.me 查看。
+这样在处理`/login`的时候，只需要在本地的map里面查找做验证就好了。
+
+- 每台机器在本地为每个用户生成一个cart_id，然后把cart_id放到redis上去，
+这样如果有三台机器，那么每个用户就会被预先生成好3个cart_id，这三个都是可以用的。
+验证的时候只要看是不是这三个之一就好。
+
+```
+   // pre-process
+   for uid in users {
+      cart_id = generate_cart_id()
+      redis.listadd(uid, cart_id)
+      cart_id_generated_by_me[uid] = cart_id
+   }
+   // wait for all machines done
+   barrier()
+   for uid in users {
+      all_cart_ids = redis.listget(uid)
+      for cart_id in all_cart_ids {
+         // all these cart_ids are valid
+         local_cart_id[cart_id] = uid
+      }
+   }
+```
+
+在处理`POST /cart`的时候，找到本机器生成的cart_id，然后返回。这里也没有网络操作。
+
+```
+   // POST /cart
+   uid = valid_token_and_get_uid(token)
+   if cart_id_generated_by_me_is_used[uid] {
+      // slow path
+      // generate a new cart_id
+      // too simple to show here
+   } else {
+      cart_id_generated_by_me_is_used[uid] = true
+      // return cart_id_generated_by_me[uid]
+      reply_cart_id_generated_by_me()
+   }
+```
+
+在需要验证cart_id的时候：
+
+```
+   // when validing the cart_id
+   uid = local_cart_id[cart_id]
+   if uid == nil {
+      invalid_cart_id()
+      return
+   }
+```
+
+- 在添加食物的时候，老老实实添加食物就好了，但是可以利用redis的list操作会返回list里元素的个数，检查是不是超过3个food。
+
+```
+   // PATCH /cart/:cart_id
+   uid = valid_token_and_get_uid(token)
+   valid_cart_id(cart_id)
+   valid_food_id(food_id)
+   loop food_count times {
+      num = redis.listadd(cart_id, food_id)
+      if num > 3 {
+         reply_too_much()
+         return
+      }
+   }
+   reply_ok()
+```
+
+需要一次listadd操作。
+
+- 重头戏是提交订单`POST /order`。
+这里也是一个比较大的trick。想想京东不会把所有的存货都放到北京的仓库里面吧？对的，每台机器先从redis里面拿一定量的food出来（这里是333个），
+然后如果本地货源充足，就不用走redis了。(大多数情况是不走redis的，所以大多数情况是只有一次同步的网络请求）
+如果本地的存货不够了，那么就通知所有机器把当前这种food全部退回到redis中，当所有人都退回之后，
+之后的每次操作都从redis中读取。当然读取的时候也要按照optimistic的方法，即先去减一，如果发现小于0了，直接abort订单，并且异步的把之前减一的再加回去。
+
+```
+   // pre-process
+   for food_id in foods {
+      tot_amount = foods_amount_from_mysql[food_id]
+      redis.setnx(food_id, tot_amount)
+      local_food_amount[food_id] = tot_amount / machine_number
+      redis.decrby(food_id, local_food_amount[food_id])
+   }
+
+   // when POST /order
+   uid = valid_token_and_get_uid(token)
+   valid_cart_id(cart_id)
+   cart = redis.listget(cart_id)
+   for i, foor_id := carts {
+      // use CAS operations to protect this when implementing
+      int result = --local_food_amount[food_id]
+      if result > 0 {
+         local_served[i] = true
+      } else if result == 0 {
+         local_served[i] = true
+         notify_other_machines_to_return_food(food_id)
+      } else {
+         local_served[i] = false
+         notify_other_machines_to_return_food(food_id)
+         // this will block
+         wait_for_other_machines_to_return_food(food_id)
+      }
+   }
+   if all_true(local_served) {
+      // do nothing
+   } else {
+      for_those_food_id_not_local_served {
+         result = redis.decr(food_id)
+         if result < 0 {
+            reply_food_not_enough
+            go func() {
+               for_food_is_that_has_been_decreased {
+                  redis.incr(food_id)
+               }
+            }
+            return
+         }
+      }
+   }
+   succ = redis.setnx(token_id_as_order_id, the_order_string)
+   if !succ {
+      reply_one_user_cannot_order_twice
+      return
+   }
+   reply_ok
+```
+
+- 订单查询还是很方便的，测试中对于性能也没太大要求。可以做本地缓存。
+- food的个数的查询，采用异步的方式，每个机器没隔一段时间，就把自己本地剩余的数量放到redis上去，
+然后redis拿到所有机器中剩余food的数量和在redis存放的数量，加在一起，更新机器本地的缓存就好。
 
 
-### 性能测试
+最后有几点提一下，token和cart_id的预先生成不会产生很严重的安全问题。至少和猜对密码是同等level的。
+food的异步统计也不会产生很大的问题，毕竟高并发情况下很难说究竟剩下多少food。
 
-性能测试基于腾讯云。
+## The biggest problem
 
-* 代码会镜像部署在 3 台 2CPU - 4GB 服务器上。
+最大的问题在于，要知道有多少个机器，才能够使用go的channel和redis的pubsub进行机器之间的同步。
 
-* Redis 和 MySQL 各提供一台。和应用服务器独立。
+这里使用的一种比较傻的办法，每个机器在启动的时候`redis.incr("SIGNAL")`，然后等待5s，
+最后再`redis.get("SIGNAL")`，这样如果没出太大问题，就可以知道运行的机器的个数了。
 
-* 测试脚本会以模拟 1000 并发，以 round robin 的负载均衡策略均衡的请求 3 台服务器。
+barrier()的实现，就是等所有机器都发过来一个signal的publish。
+wait_for_other_machines_to_return_food也是类似的方式。只要把go的channel和redis的pubsub结合在一起就好了。
 
-* 脚本模拟基础用户下单流程，最终成绩以每秒成功订单数为准。
 
-请注意代码中对应的环境变量，不要写死对应的值，而是根据环境变量获取。
+## 最最后的教训
+
+Seeing is believing. Never trust anyone indiscriminately, since he is not in your shoes.
+
+Good luck.
+
+MK
+Dec. 4th, 2015
